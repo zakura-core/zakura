@@ -106,18 +106,62 @@ fn reissuance_fraction_changes_at_nu7_1() {
     ));
 }
 
-/// The reissuance trigger keeps NU7's fraction even where NU7.1 shares NU7's height.
+/// Returns whether the reference NSM subsidy at `height` is below the scheduled
+/// subsidy, computed directly from the reserve, fraction and subsidy there.
+fn reference_below_subsidy(network: &Network, height: Height) -> bool {
+    let parent = height.previous().unwrap();
+    let reserve =
+        u128::try_from(MAX_MONEY).unwrap() - scheduled_issuance_zatoshis(parent, network).unwrap();
+    let reference = (reserve * block_subsidy_fraction_numerator(network, height).unwrap())
+        .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
+    reference < amount_to_u128(halving_block_subsidy(height, network).unwrap())
+}
+
+/// Checks that `crossing` is the first crossing after `after`: the reference
+/// subsidy is below the scheduled subsidy there, and not one block earlier.
+fn assert_first_crossing(network: &Network, crossing: Height, after: Height) {
+    assert!(crossing > after);
+    assert!(reference_below_subsidy(network, crossing));
+    assert!(!reference_below_subsidy(
+        network,
+        crossing.previous().unwrap()
+    ));
+}
+
+/// From NU7.1, the trigger uses ZIP 223's 20 second subsidy and fraction. With
+/// NU7 and NU7.1 both at height 1, the 1,100 fraction gives 22,409,143. NU7's
+/// 1,375 would give 24,227,324.
 #[test]
-fn reissuance_trigger_keeps_the_nu7_fraction_at_a_shared_nu7_1_height() {
+fn reissuance_trigger_uses_the_nu7_1_fraction_from_nu7_1() {
     let network = nu7_1_network(840_000, 1).unwrap();
+    let crossing = nsm_reissuance_crossing_height(&network).unwrap().unwrap();
+    assert_eq!(crossing, Height(22_409_143));
+    assert_first_crossing(&network, crossing, Height(1));
+}
+
+/// NU7.1 inside the third halving era splits the search, as it would on Testnet,
+/// whose third halving is past but whose reissuance hasn't started. A crossing
+/// before NU7.1 stays where NU7's rules put it.
+#[test]
+fn reissuance_trigger_splits_at_nu7_1_inside_the_third_halving_era() {
+    let nu7_only = custom_network(840_000);
+    let third_halving = height_for_halving(NSM_REISSUANCE_START_HALVING, &nu7_only).unwrap();
+    let nu7_crossing = nsm_reissuance_crossing_height(&nu7_only).unwrap().unwrap();
+
+    let nu7_1 = third_halving.0 + (nu7_crossing.0 - third_halving.0) / 2;
+    let network = nu7_1_network(840_000, nu7_1).unwrap();
     assert_eq!(
-        block_subsidy_fraction_numerator(&network, Height(1)),
-        Ok(1_100)
+        height_for_halving(NSM_REISSUANCE_START_HALVING, &network),
+        Some(third_halving)
     );
-    // NU7's 1,375 gives this crossing. NU7.1's 1,100 would give 22,409,143.
+    let crossing = nsm_reissuance_crossing_height(&network).unwrap().unwrap();
+    assert_ne!(crossing, nu7_crossing);
+    assert_first_crossing(&network, crossing, Height(nu7_1));
+
+    let late = nu7_1_network(840_000, nu7_crossing.0 + 1_000).unwrap();
     assert_eq!(
-        nsm_reissuance_crossing_height(&network),
-        Ok(Some(Height(24_227_324)))
+        nsm_reissuance_crossing_height(&late).unwrap(),
+        Some(nu7_crossing)
     );
 }
 

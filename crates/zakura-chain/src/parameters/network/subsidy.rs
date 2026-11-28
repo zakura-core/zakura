@@ -600,17 +600,8 @@ pub fn block_subsidy_fraction_numerator(
     } else {
         POST_NU7_POW_TARGET_SPACING
     };
-    reissuance_fraction_numerator_for_spacing(network, spacing)
-}
-
-/// Returns `floor(LN2_SCALED / H)`, where `H` is the halving interval at `spacing` seconds.
-///
-/// Computing `LN2_SCALED * spacing / (PostBlossomHalvingInterval * 75)` keeps the interval
-/// exact for any configured post-Blossom interval.
-fn reissuance_fraction_numerator_for_spacing(
-    network: &Network,
-    spacing: u32,
-) -> Result<u128, SubsidyError> {
+    // `LN2_SCALED * spacing / (PostBlossomHalvingInterval * 75)` keeps the interval exact
+    // for any configured post-Blossom interval.
     let interval_blocks_times_spacing = u128::try_from(network.post_blossom_halving_interval())
         .map_err(|_| SubsidyError::InvalidReissuanceFraction)?
         * u128::from(POST_BLOSSOM_POW_TARGET_SPACING);
@@ -635,7 +626,9 @@ const NSM_REISSUANCE_START_HALVING: u32 = 3;
 /// The crossing is the first height after the third halving where the reference
 /// NSM subsidy, assuming no funds were removed from circulation, is less than the
 /// scheduled block subsidy. ZIP 218's 25-second spacing, its effect on halving
-/// heights, and per-block subsidy rounding are included through `network`.
+/// heights, and per-block subsidy rounding are included through `network`. From
+/// NU7.1, ZIP 223's 20 second subsidy and reissuance fraction apply, so a crossing
+/// before NU7.1 stays where NU7's rules put it.
 ///
 /// Searches through [`Height::MAX`] if the fourth halving is beyond the supported
 /// height range. Returns `None` when NU7 is not configured or the third halving era
@@ -667,24 +660,38 @@ pub(crate) fn nsm_reissuance_crossing_height(
         return Ok(None);
     }
 
-    let parent = first_candidate
-        .previous()
-        .map_err(|_| SubsidyError::UnsupportedHeight)?;
-    let supply_before_first = scheduled_issuance_zatoshis(parent, network)?;
-    let subsidy = amount_to_u128(halving_block_subsidy(first_candidate, network)?);
     let max_money = u128::try_from(MAX_MONEY).map_err(|_| SubsidyError::Overflow)?;
 
-    Ok(first_nsm_crossing_in_subsidy_run(
-        first_candidate.0,
-        run_end.0,
-        supply_before_first,
-        subsidy,
-        max_money,
-        // ZIP 223 leaves the trigger open for a second spacing change, so it keeps
-        // NU7's fraction until that's specified, even where NU7.1 shares NU7's height.
-        reissuance_fraction_numerator_for_spacing(network, POST_NU7_POW_TARGET_SPACING)?,
-    )?
-    .map(Height))
+    // ZIP 223 leaves the trigger's rule text open for a second spacing change. This
+    // follows its stated intent: each height uses its own scheduled subsidy and
+    // reissuance fraction, and the reference reserve keeps every era's rounding.
+    // Within the third halving era, both only change at NU7.1, so search each part
+    // with its own values.
+    let mut start = first_candidate;
+    loop {
+        let end = next_subsidy_boundary(start, network)
+            .and_then(|boundary| boundary.previous().ok())
+            .map_or(run_end, |end| end.min(run_end));
+        let parent = start
+            .previous()
+            .map_err(|_| SubsidyError::UnsupportedHeight)?;
+
+        if let Some(crossing) = first_nsm_crossing_in_subsidy_run(
+            start.0,
+            end.0,
+            scheduled_issuance_zatoshis(parent, network)?,
+            amount_to_u128(halving_block_subsidy(start, network)?),
+            max_money,
+            block_subsidy_fraction_numerator(network, start)?,
+        )? {
+            return Ok(Some(Height(crossing)));
+        }
+
+        if end >= run_end {
+            return Ok(None);
+        }
+        start = end.next().map_err(|_| SubsidyError::UnsupportedHeight)?;
+    }
 }
 
 /// Returns the first reference NSM crossing in a constant-subsidy run.

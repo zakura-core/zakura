@@ -37,6 +37,7 @@ use zakura_chain::{
 use zakura_consensus::Request;
 use zakura_network::{
     address_book_peers::MockAddressBookPeers,
+    constants::CURRENT_NETWORK_PROTOCOL_VERSION,
     types::{MetaAddr, PeerServices},
 };
 use zakura_node_services::{mempool, BoxError};
@@ -723,6 +724,7 @@ fn snapshot_rpc_getinfo(info: GetInfoResponse, settings: &insta::Settings) {
     assert_eq!(info["subversion"].as_str().unwrap(), "RPC test");
     info["subversion"] = "[SubVersion]".into();
     info["errorstimestamp"] = "[LastErrorTimestamp]".into();
+    redact_protocol_version(&mut info);
 
     settings.bind(|| {
         insta::assert_json_snapshot!("get_info", info);
@@ -935,9 +937,25 @@ fn snapshot_rpc_getnetworkinfo(
     get_network_info: GetNetworkInfoResponse,
     settings: &insta::Settings,
 ) {
+    let mut get_network_info =
+        serde_json::to_value(get_network_info).expect("RPC response serializes to JSON");
+    redact_protocol_version(&mut get_network_info);
+
     settings.bind(|| {
         insta::assert_json_snapshot!("get_network_info", get_network_info);
     });
+}
+
+/// Replaces `protocolversion` with a placeholder after checking it is the advertised version.
+///
+/// Test builds advertise the NU7.1 version, which release binaries never report, so the
+/// Mainnet and Testnet snapshots must not record it.
+fn redact_protocol_version(response: &mut serde_json::Value) {
+    assert_eq!(
+        response["protocolversion"].as_u64(),
+        Some(u64::from(CURRENT_NETWORK_PROTOCOL_VERSION.0)),
+    );
+    response["protocolversion"] = "[ProtocolVersion]".into();
 }
 
 /// Snapshot `getpeerinfo` response, using `cargo insta` and JSON serialization.

@@ -181,7 +181,9 @@ impl Default for Nonce {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION;
+    use crate::constants::{
+        CURRENT_NETWORK_PROTOCOL_VERSION, NU7_1_PROTOCOL_VERSION, NU7_PROTOCOL_VERSION,
+    };
 
     #[test]
     fn version_extremes_mainnet() {
@@ -257,23 +259,59 @@ mod test {
         }
     }
 
-    /// Checks that Zakura advertises the Mainnet NU7 version, which meets the NU7
-    /// minimum on every network.
+    /// Checks that the release protocol version is the Mainnet NU7 version, which meets
+    /// the NU7 minimum on every network. Test builds advertise the NU7.1 version instead,
+    /// so this checks the constant rather than the advertised version.
     #[test]
-    fn nu7_protocol_versions_match_current_version() {
+    fn nu7_protocol_version_matches_nu7_minimum() {
         let _init_guard = zakura_test::init();
 
         assert_eq!(
             Version::min_specified_for_upgrade(&Mainnet, Nu7),
-            CURRENT_NETWORK_PROTOCOL_VERSION
+            NU7_PROTOCOL_VERSION
         );
         for network in [
             Network::new_default_testnet(),
             Network::new_regtest(Default::default()),
         ] {
+            assert!(Version::min_specified_for_upgrade(&network, Nu7) <= NU7_PROTOCOL_VERSION);
+        }
+    }
+
+    /// Checks that the test-build protocol version is the Mainnet NU7.1 version, which
+    /// meets the NU7.1 minimum on every network.
+    #[test]
+    fn nu7_1_protocol_version_matches_nu7_1_minimum() {
+        let _init_guard = zakura_test::init();
+
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Mainnet, Nu7_1),
+            NU7_1_PROTOCOL_VERSION
+        );
+        for network in [
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
+        ] {
+            assert!(Version::min_specified_for_upgrade(&network, Nu7_1) <= NU7_1_PROTOCOL_VERSION);
+        }
+    }
+
+    /// Checks that Zakura meets the NU7.1 minimum exactly when it knows NU7.1's branch
+    /// ID: release builds stay at NU7, and test builds can run past NU7.1 on networks
+    /// that activate it.
+    #[test]
+    fn nu7_1_protocol_version_follows_its_branch_id() {
+        let _init_guard = zakura_test::init();
+
+        for network in [Mainnet, Network::new_regtest(Default::default())] {
             assert!(
                 Version::min_specified_for_upgrade(&network, Nu7)
                     <= CURRENT_NETWORK_PROTOCOL_VERSION
+            );
+            assert_eq!(
+                Version::min_specified_for_upgrade(&network, Nu7_1)
+                    <= CURRENT_NETWORK_PROTOCOL_VERSION,
+                Nu7_1.branch_id().is_some(),
             );
         }
     }

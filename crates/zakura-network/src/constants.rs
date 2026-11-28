@@ -15,6 +15,7 @@ use zakura_chain::{
         Network::{self, *},
         NetworkKind,
         NetworkUpgrade::*,
+        NU7_1_HAS_BRANCH_ID,
     },
     serialization::Duration32,
 };
@@ -437,13 +438,21 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
-// ZIP 204 assigns NU7 the protocol version 170_180 on Testnet and 170_190 on Mainnet.
-// `Version::min_specified_for_upgrade` holds the same values. Mainnet and Testnet both have
-// an NU7 height, so one binary advertises the Mainnet value, which also meets the Testnet
-// minimum.
-// Next upgrade values, set once Zakura implements every NU7.1 rule:
-//   const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_210; // NU7.1 (Mainnet + Testnet).
-const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_190; // NU7 (Mainnet + Testnet).
+/// The protocol version release builds advertise: ZIP 204's NU7 Mainnet version.
+///
+/// ZIP 204 assigns NU7 170_180 on Testnet and 170_190 on Mainnet, as
+/// `Version::min_specified_for_upgrade` records. Mainnet and Testnet both have an NU7 height,
+/// so one binary advertises the Mainnet value, which also meets the Testnet minimum.
+pub(crate) const NU7_PROTOCOL_VERSION: Version = Version(170_190);
+
+/// The protocol version test builds advertise: ZIP 204's NU7.1 Mainnet version.
+///
+/// ZIP 204 assigns NU7.1 170_200 on Testnet and 170_210 on Mainnet. Release builds advertise
+/// NU7.1 support only once the deployment ZIP assigns its heights and every NU7.1 rule
+/// ships. Test builds know NU7.1's placeholder branch ID, so they advertise NU7.1 to run
+/// Regtest and configured Testnets past its activation: a node whose own version is below
+/// an active upgrade's minimum stops.
+pub(crate) const NU7_1_PROTOCOL_VERSION: Version = Version(170_210);
 
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.
@@ -456,8 +465,13 @@ const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_190; // NU7 (Mainnet + T
 ///
 /// This version of Zebra draws the current network protocol version from
 /// [ZIP-255](https://zips.z.cash/zip-0255).
-pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version =
-    Version(CURRENT_NETWORK_PROTOCOL_VERSION_VALUE);
+// The version follows the branch ID table, so the advertised version and the accepted
+// branch IDs cannot disagree.
+pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = if NU7_1_HAS_BRANCH_ID {
+    NU7_1_PROTOCOL_VERSION
+} else {
+    NU7_PROTOCOL_VERSION
+};
 
 /// The default RTT estimate for peer responses.
 ///

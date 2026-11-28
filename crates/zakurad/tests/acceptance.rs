@@ -2691,6 +2691,33 @@ async fn regtest_coinbase_names_the_gateway() -> Result<()> {
     common::coinbase::regtest_coinbase_names_the_gateway().await
 }
 
+/// Mines through NU7.1 activation and spends, rejects, and reloads ZIP 248 v7
+/// transactions on Regtest.
+///
+/// See [`common::zip248::v7_transactions_across_nu7_1_test`] for the steps.
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_v7_transactions_across_nu7_1() -> Result<()> {
+    common::zip248::v7_transactions_across_nu7_1_test().await
+}
+
+/// Mines a ZIP 248 v7 coinbase that pays a unified miner address through Ironwood.
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_v7_coinbase_pays_ironwood() -> Result<()> {
+    common::zip248::v7_coinbase_pays_ironwood_test().await
+}
+
+/// Relays ZIP 248 v7 blocks, by BPv1, and a v7 transaction between two Regtest nodes.
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_v7_transactions_relay_between_nodes() -> Result<()> {
+    common::zip248::v7_transactions_relay_between_nodes_test().await
+}
+
+/// Shields a v7 coinbase output into Ironwood and spends it back, with real proofs.
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_v7_ironwood_round_trip() -> Result<()> {
+    common::zip248::v7_ironwood_round_trip_test().await
+}
+
 #[cfg(feature = "indexer-rpc")]
 #[tokio::test(flavor = "multi_thread")]
 async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {

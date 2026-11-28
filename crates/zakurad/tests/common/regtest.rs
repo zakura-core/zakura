@@ -568,6 +568,8 @@ async fn assert_transparent_index_rpcs_fail(
 pub trait MiningRpcMethods {
     async fn block_from_template(&self, net: &Network) -> Result<(Block, Height)>;
     async fn submit_block(&self, block: Block) -> Result<()>;
+    async fn submit_block_response(&self, block: &Block) -> Result<SubmitBlockResponse>;
+    async fn propose(&self, block: &Block) -> Result<BlockProposalResponse>;
     async fn get_block(&self, height: i32) -> Result<Option<Arc<Block>>, BoxError>;
     async fn generate(&self, num_blocks: u32) -> Result<Vec<block::Hash>>;
     async fn blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
@@ -589,19 +591,33 @@ impl MiningRpcMethods for RpcRequestClient {
     }
 
     async fn submit_block(&self, block: Block) -> Result<()> {
-        let block_data = hex::encode(block.zcash_serialize_to_vec()?);
-
-        let submit_block_response: SubmitBlockResponse = self
-            .json_result_from_call("submitblock", format!(r#"["{block_data}"]"#))
-            .await
-            .map_err(|err| eyre!(err))?;
-
-        match submit_block_response {
+        match self.submit_block_response(&block).await? {
             SubmitBlockResponse::Accepted => Ok(()),
             SubmitBlockResponse::ErrorResponse(err) => {
                 Err(eyre!("block submission failed: {err:?}"))
             }
         }
+    }
+
+    /// Submits `block` and returns the node's response, whether or not it accepts it.
+    async fn submit_block_response(&self, block: &Block) -> Result<SubmitBlockResponse> {
+        let block_data = hex::encode(block.zcash_serialize_to_vec()?);
+
+        self.json_result_from_call("submitblock", format!(r#"["{block_data}"]"#))
+            .await
+            .map_err(|err| eyre!(err))
+    }
+
+    /// Checks `block` with `getblocktemplate` proposal mode.
+    async fn propose(&self, block: &Block) -> Result<BlockProposalResponse> {
+        let block_data = hex::encode(block.zcash_serialize_to_vec()?);
+
+        self.json_result_from_call(
+            "getblocktemplate",
+            format!(r#"[{{"mode":"proposal","data":"{block_data}"}}]"#),
+        )
+        .await
+        .map_err(|err| eyre!(err))
     }
 
     async fn get_block(&self, height: i32) -> Result<Option<Arc<Block>>, BoxError> {
@@ -643,15 +659,8 @@ impl MiningRpcMethods for RpcRequestClient {
     /// Gets a block template, checks it with `getblocktemplate` proposal mode, then submits it.
     async fn mine_proposed_block(&self, net: &Network) -> Result<Block> {
         let (block, _height) = self.block_from_template(net).await?;
-        let block_data = hex::encode(block.zcash_serialize_to_vec()?);
 
-        let proposal: BlockProposalResponse = self
-            .json_result_from_call(
-                "getblocktemplate",
-                format!(r#"[{{"mode":"proposal","data":"{block_data}"}}]"#),
-            )
-            .await
-            .map_err(|err| eyre!(err))?;
+        let proposal = self.propose(&block).await?;
         if proposal != BlockProposalResponse::Valid {
             return Err(eyre!("block proposal was rejected: {proposal:?}"));
         }

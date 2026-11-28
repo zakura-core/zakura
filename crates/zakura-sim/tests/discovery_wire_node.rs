@@ -50,9 +50,11 @@ const DISCOVERY_TASKS: [&str; 5] = [
     "discovery_source",
 ];
 
-/// Runs the node with one verification slot and `peer-1`'s address, where
-/// no peer listens, as its static candidate, and `peer-0` dialing and
-/// opening a discovery stream, under the all-defaults Plan.
+/// Runs the node with one verification slot, `peer-1`'s address as its
+/// bootstrap peer and `peer-2`'s as a book entry, where no peer listens on
+/// either, and `peer-0` dialing and opening a discovery stream, under the
+/// all-defaults Plan. Only the bootstrap dialer dials a bootstrap peer, so
+/// the book entry is what the candidate dialer dials.
 fn run() -> RunReport {
     let mut sim = Sim::new(wire_config(), Plan::from_fuzz(&[]));
     spawn(
@@ -61,6 +63,7 @@ fn run() -> RunReport {
         &NodeSpec {
             verification_slots: 1,
             static_candidates: vec![1],
+            book_candidates: vec![2],
             peer_sample_limit: None,
         },
         &[PeerSpec {
@@ -136,6 +139,7 @@ fn run_peers(static_candidates: Vec<usize>, peers: &[PeerSpec]) -> RunReport {
         &NodeSpec {
             verification_slots: 1,
             static_candidates,
+            book_candidates: Vec::new(),
             peer_sample_limit: None,
         },
         peers,
@@ -431,6 +435,7 @@ fn a_redial_the_peer_never_handled() {
                 &NodeSpec {
                     verification_slots: 1,
                     static_candidates: vec![0],
+                    book_candidates: Vec::new(),
                     peer_sample_limit: None,
                 },
                 &peers,

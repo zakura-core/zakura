@@ -699,6 +699,12 @@ streams carrying seven messages (`decision-13`):
 - The **control stream** carries `Want`, `StripeDone`, and `BlockDone`.
 - The **data stream** carries `HeaderMeta`, `Part`, `Have`, and `WantEnd`.
 
+Both streams are at stream version 2, which capability bit 13 offers.
+Version 1 carried `HeaderMeta` on the control stream. Capability bit 12,
+which offered version 1, is retired and MUST NOT be reused. A node offers
+only version 2, so a peer that offers only bit 12 runs no BPv1 session with it
+and keeps the connection (COMPAT-9). There is no compatibility path.
+
 `Subscribe`, `Unsubscribe`, `Refuse`, `SubscriptionEnd`, and `Advert` from
 revision 2 are omitted in BPv1 (`decision-13`).
 

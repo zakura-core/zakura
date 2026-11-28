@@ -1,8 +1,8 @@
 //! BPv1 wire format, message tables, `WireMessage` codecs, and shared FIFO
 //! stream writer (decision-6, decision-7, decision-13, decision-14).
 //!
-//! BPv1 carries seven messages across two persistent ordered streams under one
-//! capability bit (`ZAKURA_CAP_BPV1 = 1 << 12`):
+//! BPv1 carries seven messages across two persistent ordered streams at stream
+//! version 2, under one capability bit (`ZAKURA_CAP_BPV1 = 1 << 13`):
 //! - Control stream (`BPV1_CONTROL_KIND = 11`): `Want`, `StripeDone`, `BlockDone`
 //! - Data stream (`BPV1_DATA_KIND = 12`): `HeaderMeta`, `Part`, `Have`, `WantEnd`
 
@@ -29,8 +29,11 @@ use crate::zakura::{
     FRAME_HEADER_BYTES,
 };
 
-/// Capability bit for BPv1 block propagation.
-pub const ZAKURA_CAP_BPV1: u64 = 1 << 12;
+/// Capability bit for BPv1 block propagation (stream version 2).
+///
+/// Bit `1 << 12` offered stream version 1, which carried `HeaderMeta` on the
+/// control stream. It is retired and MUST NOT be reused (COMPAT-9).
+pub const ZAKURA_CAP_BPV1: u64 = 1 << 13;
 
 /// Control stream kind: `Want`, `StripeDone`, `BlockDone`.
 pub const BPV1_CONTROL_KIND: u16 = 11;
@@ -39,7 +42,9 @@ pub const BPV1_CONTROL_KIND: u16 = 11;
 pub const BPV1_DATA_KIND: u16 = 12;
 
 /// Current stream version for both BPv1 streams.
-pub const BPV1_STREAM_VERSION: u16 = 1;
+///
+/// Version 2 moved `HeaderMeta` from the control stream to the data stream.
+pub const BPV1_STREAM_VERSION: u16 = 2;
 
 /// Protocol maximum live `Want`s per connection direction; server closes only above 2×.
 pub const MAX_WANTS_INFLIGHT: u32 = 64;

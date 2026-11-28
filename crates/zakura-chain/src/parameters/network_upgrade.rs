@@ -298,6 +298,11 @@ pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 /// `PostNU7PoWTargetSpacing` in ZIP 218.
 pub const POST_NU7_POW_TARGET_SPACING: u32 = 25;
 
+/// The target block spacing after NU7.1 activation, in seconds.
+///
+/// `TwentySecondPoWTargetSpacing` in ZIP 223.
+pub const POST_NU7_1_POW_TARGET_SPACING: u32 = 20;
+
 /// The ratio between the post-Blossom and post-NU7 block target spacings.
 ///
 /// `NU7PoWTargetSpacingRatio` in ZIP 218:
@@ -381,7 +386,8 @@ pub const GLOBAL_SHIELDED_BUDGET: u32 = 330;
 const PRE_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
 
 /// The multiplier used to derive the Testnet minimum difficulty time gap from
-/// NU7 onwards, preserving the pre-NU7 gap of 450 seconds.
+/// NU7 onwards. It preserves the pre-NU7 gap of 450 seconds at NU7, and gives
+/// ZIP 223's 360 seconds at NU7.1.
 const POST_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 18;
 
 /// The start height for the testnet minimum difficulty consensus rule.
@@ -536,7 +542,8 @@ impl NetworkUpgrade {
             Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
-            Nu7 | Nu7_1 => POST_NU7_POW_TARGET_SPACING.into(),
+            Nu7 => POST_NU7_POW_TARGET_SPACING.into(),
+            Nu7_1 => POST_NU7_1_POW_TARGET_SPACING.into(),
 
             #[cfg(zcash_unstable = "zfuture")]
             ZFuture => POST_NU7_POW_TARGET_SPACING.into(),
@@ -563,6 +570,7 @@ impl NetworkUpgrade {
                 POST_BLOSSOM_POW_TARGET_SPACING.into(),
             ),
             (NetworkUpgrade::Nu7, POST_NU7_POW_TARGET_SPACING.into()),
+            (NetworkUpgrade::Nu7_1, POST_NU7_1_POW_TARGET_SPACING.into()),
         ]
         .into_iter()
         .filter_map(move |(upgrade, spacing_seconds)| {
@@ -635,12 +643,14 @@ impl NetworkUpgrade {
     /// Returns the averaging window for difficulty threshold arithmetic mean
     /// calculations.
     ///
-    /// `PoWAveragingWindow` in ZIP 218, which widens the window at NU7.
+    /// `PoWAveragingWindow` in ZIP 218, which widens the window at NU7, and
+    /// ZIP 223, which widens it again at NU7.1.
     pub fn averaging_window(&self) -> usize {
         match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy
             | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => PRE_NU7_POW_AVERAGING_WINDOW,
-            Nu7 | Nu7_1 => POST_NU7_POW_AVERAGING_WINDOW,
+            Nu7 => POST_NU7_POW_AVERAGING_WINDOW,
+            Nu7_1 => POST_NU7_1_POW_AVERAGING_WINDOW,
 
             #[cfg(zcash_unstable = "zfuture")]
             ZFuture => POST_NU7_POW_AVERAGING_WINDOW,

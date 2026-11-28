@@ -182,15 +182,17 @@ fn header_daa_accepts_valid_threshold_with_full_context() {
 }
 
 /// The difficulty-context reader takes the span for the candidate height, which
-/// ZIP 218 widens at NU7.
+/// ZIP 218 widens at NU7 and ZIP 223 widens again at NU7.1.
 #[test]
 fn difficulty_context_follows_the_candidate_height() {
     let _init_guard = zakura_test::init();
 
     const NU7: u32 = 1_000;
+    const NU7_1: u32 = 2_000;
     let network = Network::new_regtest(
         zakura_chain::parameters::testnet::ConfiguredActivationHeights {
             nu7: Some(NU7),
+            nu7_1: Some(NU7_1),
             ..Default::default()
         }
         .into(),
@@ -203,6 +205,9 @@ fn difficulty_context_follows_the_candidate_height() {
         (NU7 - 1, difficulty::POW_ADJUSTMENT_BLOCK_SPAN),
         (NU7, nu7_span),
         (NU7 + 1, nu7_span),
+        (NU7_1 - 1, nu7_span),
+        (NU7_1, difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN),
+        (NU7_1 + 1, difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN),
     ] {
         assert_eq!(
             difficulty_context(&network, block::Height(candidate_height), ancestors.clone()).len(),

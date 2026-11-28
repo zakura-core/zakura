@@ -1490,9 +1490,10 @@ impl HeaderSyncReactor {
         if !self.bpv1_hold {
             return None;
         }
-        let claims = self.startup.body_claims.as_ref()?;
-        claims.prune_expired(Instant::now());
-        claims.next_expiry()
+        self.startup
+            .body_claims
+            .as_ref()?
+            .next_live_expiry(Instant::now())
     }
 
     /// Lets the cached pass reconsider the offers held for BPv1.

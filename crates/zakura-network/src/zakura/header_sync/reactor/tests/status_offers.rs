@@ -3147,3 +3147,114 @@ fn header_sync_holds_only_a_bpv1_peer_inside_the_window() {
     expect_locator_query(&mut actions, &bpv1_peer, below);
     assert!(!claims.is_claimed(below, Instant::now()));
 }
+
+/// The running reactor ends a BPv1 hold on its own: when BPv1 releases the
+/// claim, and when the reservation expires.
+#[tokio::test(start_paused = true)]
+async fn the_running_reactor_wakes_a_bpv1_hold_on_release_and_on_expiry() {
+    use zakura_node_services::body_claims::{BodyClaimRelease, Bpv1Window, SharedBodyClaims};
+
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let claims = SharedBodyClaims::new();
+    let grace = std::time::Duration::from_secs(10);
+    claims.set_bpv1_window(Some(Bpv1Window {
+        low_exclusive: 0,
+        high_inclusive: 16,
+        grace,
+    }));
+    startup.body_claims = Some(claims.clone());
+    let (handle, mut actions, _task) =
+        spawn_header_sync_reactor(startup).expect("the reactor starts");
+    let mut sessions = Vec::new();
+    let mut connect = |byte: u8| {
+        let peer =
+            ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has the required length");
+        claims.set_bpv1_peer([byte; 32], true);
+        let (send, outbound) = framed_channel(8);
+        sessions.push(outbound);
+        (
+            peer.clone(),
+            PeerSession::from_parts(peer, send, CancellationToken::new()),
+        )
+    };
+    let settle = || async {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    };
+
+    // BPv1 releases the claim on the held target: header sync fetches it at once.
+    let (released_peer, session) = connect(0x34);
+    handle
+        .send(Event::PeerConnected(session))
+        .await
+        .expect("the peer connects");
+    let released = block::Hash([0x44; 32]);
+    let start = Instant::now();
+    handle
+        .send(Event::Status {
+            peer: released_peer.clone(),
+            session_id: 0,
+            status: status_for(&snapshot, released),
+        })
+        .await
+        .expect("the status reaches the reactor");
+    settle().await;
+    assert!(
+        actions.try_recv().is_err(),
+        "the header waits for HeaderMeta"
+    );
+    assert!(claims.claim_at(released, start + grace, Instant::now()));
+    claims.release(released, BodyClaimRelease::Fallback);
+    match actions.recv().await {
+        Some(HeaderPortOperation::QueryHeaderLocator {
+            peer,
+            target_tip_hash,
+            ..
+        }) => {
+            assert_eq!((peer, target_tip_hash), (released_peer, released));
+        }
+        other => panic!("expected the released target's locator query, got {other:?}"),
+    }
+    assert!(
+        Instant::now() < start + grace,
+        "the release, not the grace, woke it"
+    );
+
+    // No HeaderMeta arrives: header sync fetches the header when the grace ends.
+    let (expired_peer, session) = connect(0x35);
+    handle
+        .send(Event::PeerConnected(session))
+        .await
+        .expect("the peer connects");
+    let expired = block::Hash([0x45; 32]);
+    let start = Instant::now();
+    handle
+        .send(Event::Status {
+            peer: expired_peer.clone(),
+            session_id: 0,
+            status: status_for(&snapshot, expired),
+        })
+        .await
+        .expect("the status reaches the reactor");
+    settle().await;
+    assert!(
+        actions.try_recv().is_err(),
+        "the header waits for HeaderMeta"
+    );
+    match actions.recv().await {
+        Some(HeaderPortOperation::QueryHeaderLocator {
+            peer,
+            target_tip_hash,
+            ..
+        }) => {
+            assert_eq!((peer, target_tip_hash), (expired_peer, expired));
+        }
+        other => panic!("expected the expired target's locator query, got {other:?}"),
+    }
+    assert!(Instant::now() >= start + grace, "the grace ended the hold");
+}

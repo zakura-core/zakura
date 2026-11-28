@@ -132,8 +132,12 @@ block sync reserves the body for the metadata grace: `2 ×` the median path RTT
 plus `META_GRACE_FLOOR`. `HeaderMeta` that arrives in the grace turns the
 reservation into the claim. Native block sync reserves each block at most once,
 and never reserves a block that it saw claimed, so BPv1 delays a body by at
-most one grace before its claim, and never after a release. A request that
-native block sync started before any claim or reservation runs to completion.
+most one grace before its claim, and never after a release. A release for any
+reason but commitment marks the block, so a later request is never reserved.
+The node remembers at most 1,024 such blocks, and reserves nothing new at that
+cap. A request that native block sync started before any claim or reservation
+runs to completion. Removing an expired claim or reservation wakes every holder
+whose timer waited on it.
 
 A peer with a live BPv1 session sends `HeaderMeta`, which carries the header,
 for each block it admits. So header sync MUST NOT fetch a header in BPv1's

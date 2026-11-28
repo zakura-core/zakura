@@ -77,12 +77,18 @@ struct Entry {
     expiry: Instant,
 }
 
+/// The most hashes that [`Table::seen`] holds. BPv1's window spans
+/// `2 × PROPAGATION_DEPTH` heights, so honest forks stay far below it. A
+/// peer's statuses can name hashes that never become blocks. At the cap
+/// nothing new is reserved, and both syncs fetch at once.
+const MAX_SEEN: usize = 1024;
+
 #[derive(Debug, Default)]
 struct Table {
     entries: HashMap<block::Hash, Entry>,
-    /// Hashes that native block sync saw reserved or claimed, by height. Native
-    /// block sync never reserves them again. A hash leaves when BPv1's window
-    /// moves above its height.
+    /// Hashes seen reserved or claimed, or released for a reason other than
+    /// commitment, by height. They are never reserved again. A hash leaves
+    /// when BPv1's window moves above its height.
     seen: HashMap<block::Hash, u32>,
     window: Option<Bpv1Window>,
     /// The node ids of the peers with a live BPv1 session. Only they send
@@ -95,6 +101,13 @@ impl Table {
         let before = self.entries.len();
         self.entries.retain(|_, entry| now < entry.expiry);
         before - self.entries.len()
+    }
+
+    /// Records `hash` at `height` in [`Self::seen`] below the cap.
+    fn see(&mut self, hash: block::Hash, height: u32) {
+        if self.seen.len() < MAX_SEEN {
+            self.seen.entry(hash).or_insert(height);
+        }
     }
 
     fn is_live(&self, hash: &block::Hash, now: Instant) -> bool {
@@ -112,7 +125,9 @@ impl Table {
 pub struct SharedBodyClaims {
     table: Arc<Mutex<Table>>,
     /// Bumped on a release for any reason but [`BodyClaimRelease::Committed`],
-    /// and when a new claim installs an earlier expiry deadline.
+    /// when a new claim installs an earlier expiry deadline, and when a prune
+    /// removes an expired entry. A holder's expiry timer may have been armed
+    /// for that entry, so its removal must wake the holder.
     generation_tx: Arc<watch::Sender<u64>>,
 }
 
@@ -147,12 +162,16 @@ impl SharedBodyClaims {
             // The comparison includes expired entries, which block sync's
             // timer may still be armed for.
             let earlier = table.entries.values().all(|entry| deadline < entry.expiry);
-            table.prune(now);
+            let pruned = table.prune(now) > 0;
             let claimed = table
                 .entries
                 .get(&hash)
                 .is_some_and(|entry| entry.kind == EntryKind::Claimed);
             if now >= deadline || claimed {
+                drop(table);
+                if pruned {
+                    self.bump_generation();
+                }
                 return false;
             }
             table.entries.insert(
@@ -162,7 +181,7 @@ impl SharedBodyClaims {
                     expiry: deadline,
                 },
             );
-            earlier
+            earlier || pruned
         };
         if earlier_expiry {
             self.bump_generation();
@@ -193,9 +212,20 @@ impl SharedBodyClaims {
     }
 
     /// Releases `hash`. Unless the block committed, notifies subscribers so
-    /// native block sync can fetch the body immediately.
+    /// native block sync can fetch the body immediately, and marks `hash`
+    /// seen, so a later [`Self::defer_to_bpv1`] never reserves it.
     pub fn release(&self, hash: block::Hash, reason: BodyClaimRelease) -> bool {
-        let removed = self.lock().entries.remove(&hash).is_some();
+        let removed = {
+            let mut table = self.lock();
+            if reason != BodyClaimRelease::Committed {
+                // The release does not carry a height. The window's top
+                // keeps the mark until the window passes it.
+                if let Some(window) = table.window {
+                    table.see(hash, window.high_inclusive);
+                }
+            }
+            table.entries.remove(&hash).is_some()
+        };
         if reason != BodyClaimRelease::Committed {
             self.bump_generation();
         }
@@ -249,10 +279,13 @@ impl SharedBodyClaims {
     pub fn defer_to_bpv1(&self, hash: block::Hash, height: u32, now: Instant) -> bool {
         let mut table = self.lock();
         if table.is_live(&hash, now) {
-            table.seen.entry(hash).or_insert(height);
+            table.see(hash, height);
             return true;
         }
-        if table.seen.contains_key(&hash) || table.bpv1_peers.is_empty() {
+        if table.seen.contains_key(&hash)
+            || table.seen.len() >= MAX_SEEN
+            || table.bpv1_peers.is_empty()
+        {
             return false;
         }
         let Some(window) = table.window.filter(|window| window.contains(height)) else {
@@ -296,7 +329,28 @@ impl SharedBodyClaims {
 
     /// Prunes expired entries (`now >= deadline`) and returns how many expired.
     pub fn prune_expired(&self, now: Instant) -> usize {
-        self.lock().prune(now)
+        let pruned = self.lock().prune(now);
+        if pruned > 0 {
+            self.bump_generation();
+        }
+        pruned
+    }
+
+    /// Prunes expired entries at `now`, as [`Self::prune_expired`] does, and
+    /// returns the earliest remaining expiry, which lies after `now`.
+    pub fn next_live_expiry(&self, now: Instant) -> Option<Instant> {
+        let (pruned, next) = {
+            let mut table = self.lock();
+            let pruned = table.prune(now);
+            (
+                pruned,
+                table.entries.values().map(|entry| entry.expiry).min(),
+            )
+        };
+        if pruned > 0 {
+            self.bump_generation();
+        }
+        next
     }
 
     /// Earliest expiry deadline across entries, for timer wakeups.
@@ -521,5 +575,88 @@ mod tests {
             !claims.defer_to_bpv1(c, 101, t1),
             "no window, no reservation"
         );
+    }
+
+    #[test]
+    fn any_prune_of_an_expired_entry_wakes_subscribers() {
+        let claims = SharedBodyClaims::new();
+        let mut generation = claims.subscribe();
+        let t0 = Instant::now();
+        let (a, b, c) = (
+            block::Hash([0xAA; 32]),
+            block::Hash([0xBB; 32]),
+            block::Hash([0xCC; 32]),
+        );
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(claims.claim_at(a, t1, t0));
+        generation.borrow_and_update();
+
+        // Another holder's claim prunes `a`, whose expiry a timer may still wait for.
+        assert!(claims.claim_at(b, t1 + Duration::from_secs(9), t1));
+        assert!(generation.has_changed().unwrap(), "the claim's prune wakes");
+        generation.borrow_and_update();
+
+        assert!(claims.claim_at(c, t1 + Duration::from_secs(1), t1));
+        generation.borrow_and_update();
+        let t2 = t1 + Duration::from_secs(1);
+        assert_eq!(
+            claims.next_live_expiry(t2),
+            Some(t1 + Duration::from_secs(9)),
+            "the earliest expiry after the prune"
+        );
+        assert!(generation.has_changed().unwrap(), "the read's prune wakes");
+        generation.borrow_and_update();
+        assert_eq!(claims.prune_expired(t2), 0);
+        assert!(
+            !generation.has_changed().unwrap(),
+            "a prune that removes nothing does not wake"
+        );
+    }
+
+    #[test]
+    fn a_release_before_native_asks_still_hands_the_body_over_at_once() {
+        let claims = SharedBodyClaims::new();
+        let t0 = Instant::now();
+        let (released, committed) = (block::Hash([0xAA; 32]), block::Hash([0xBB; 32]));
+        claims.set_bpv1_window(window(84, 116));
+        claims.set_bpv1_peer([7; 32], true);
+        assert!(claims.claim_at(released, t0 + Duration::from_secs(15), t0));
+        assert!(claims.claim_at(committed, t0 + Duration::from_secs(15), t0));
+
+        // Native block sync never asked while the claims were live.
+        assert!(claims.release(released, BodyClaimRelease::Fallback));
+        assert!(claims.release(committed, BodyClaimRelease::Committed));
+        assert!(
+            !claims.defer_to_bpv1(released, 101, t0),
+            "a fallback release is never reserved afterwards"
+        );
+        assert!(
+            claims.defer_to_bpv1(committed, 101, t0),
+            "a committed release marks nothing"
+        );
+
+        claims.set_bpv1_window(window(116, 140));
+        assert!(
+            !claims.lock().seen.contains_key(&released),
+            "the mark leaves with the window"
+        );
+    }
+
+    #[test]
+    fn a_full_seen_set_reserves_nothing() {
+        let claims = SharedBodyClaims::new();
+        let t0 = Instant::now();
+        claims.set_bpv1_window(window(84, 116));
+        claims.set_bpv1_peer([7; 32], true);
+        for index in 0..MAX_SEEN {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+            assert!(claims.defer_to_bpv1(block::Hash(bytes), 101, t0));
+        }
+        assert!(
+            !claims.defer_to_bpv1(block::Hash([0xFF; 32]), 101, t0),
+            "at the cap, both syncs fetch at once"
+        );
+        assert_eq!(claims.lock().seen.len(), MAX_SEEN);
     }
 }

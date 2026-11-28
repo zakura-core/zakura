@@ -5347,6 +5347,49 @@ fn every_admission_exit_releases_the_early_claim() {
     assert_eq!(release_of(&failed, id), Some(ClaimRelease::Fallback));
     assert!(!claims.is_claimed(id, t0));
 
+    // Block sync committed the block while its commitment check ran.
+    let id = block::Hash([0xC7; 32]);
+    let received = start(&mut table, &claims, id);
+    let checking = header_result(&mut table, t0, &received, admitted_at(10));
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 10,
+            hash: id,
+        },
+    );
+    let committed = commitment_ok(&mut table, t0, &checking);
+    apply_claims(&claims, t0, &committed);
+    assert_eq!(release_of(&committed, id), Some(ClaimRelease::Committed));
+    assert!(!claims.is_claimed(id, t0));
+    table.assert_invariants();
+
+    // The window moved past the block while its commitment check ran. The
+    // move would end the later cases' window, so it runs on its own table.
+    let mut moved = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    moved.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 9,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let id = block::Hash([0xC8; 32]);
+    let received = start(&mut moved, &claims, id);
+    let checking = header_result(&mut moved, t0, &received, admitted_at(10));
+    moved.step(
+        t0,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0xB8; 32]),
+            height: 10 + PROPAGATION_DEPTH,
+        },
+    );
+    let passed = commitment_ok(&mut moved, t0, &checking);
+    apply_claims(&claims, t0, &passed);
+    assert_eq!(release_of(&passed, id), Some(ClaimRelease::Fallback));
+    assert!(!claims.is_claimed(id, t0));
+    moved.assert_invariants();
+
     // An admitted block keeps the claim, extended to its reconstruction
     // deadline.
     let id = block::Hash([0xC6; 32]);
@@ -5358,6 +5401,55 @@ fn every_admission_exit_releases_the_early_claim() {
     assert!(was_admitted(&admitted, id));
     assert_eq!(release_of(&admitted, id), None);
     assert_eq!(claims.next_expiry(), Some(at + RECONSTRUCTION_DEADLINE));
+    table.assert_invariants();
+}
+
+/// A block that passes its commitment check while every slot is busy
+/// releases its early claim, so native block sync fetches it at once.
+#[test]
+fn a_block_without_a_slot_releases_its_early_claim() {
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let root = [0x5A; 32];
+    let mut config = BlockConfig::for_profile(Profile::TINY);
+    config.max_concurrent_blocks = 1;
+    let mut table = BlockTable::new(config);
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 9,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let claims = SharedBodyClaims::new();
+    let admitted_at = |height| HeaderAdmissionResult::Admitted {
+        height,
+        parent_hash: TEST_TIP_HASH,
+    };
+    let admit = |table: &mut BlockTable, byte: u8, height: u32| {
+        let id = block::Hash([byte; 32]);
+        let received = receive(table, t0, make_envelope(id, coding, root, node_id(1)));
+        apply_claims(&claims, t0, &received);
+        let checking = header_result(table, t0, &received, admitted_at(height));
+        let checked = commitment_ok(table, t0, &checking);
+        apply_claims(&claims, t0, &checked);
+        (id, checked)
+    };
+
+    let (first, holds_slot) = admit(&mut table, 0xD1, 10);
+    assert!(was_admitted(&holds_slot, first));
+    let (second, refused) = admit(&mut table, 0xD2, 11);
+    assert!(!was_admitted(&refused, second));
+    assert!(
+        refused.outputs.iter().any(|o| matches!(
+            o,
+            BlockOutput::ReleaseBodyClaim { block_id, reason: ClaimRelease::Fallback }
+                if *block_id == second
+        )),
+        "the refused block releases its claim"
+    );
+    assert!(!claims.is_claimed(second, t0));
+    assert!(claims.is_claimed(first, t0));
     table.assert_invariants();
 }
 

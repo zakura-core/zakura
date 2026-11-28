@@ -490,6 +490,11 @@ impl ReactorIO {
                     }
                     if let Some(claims) = self.startup.body_claims.as_ref() {
                         let expired = claims.prune_expired(Instant::now()) > 0;
+                        // The query below reads every change so far, so the
+                        // generation this prune bumped needs no second pass.
+                        if let Some(rx) = body_claim_generation.as_mut() {
+                            rx.borrow_and_update();
+                        }
                         // A release or expiry can free a pending height that
                         // selection skipped, so wake the routines.
                         if expired || !matches!(wake, Some(Err(_))) {

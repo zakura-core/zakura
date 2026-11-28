@@ -825,6 +825,77 @@ async fn pruned_routing_waits_for_busy_archive_while_syncing() {
     assert_eq!(peers.pruned.written_now().await, None);
 }
 
+/// A second announcement can finish the original download even before the registry sees it.
+#[tokio::test(start_paused = true)]
+async fn another_announcer_serves_transaction_after_miss_or_disconnect() {
+    for (disconnect, second_has_body) in [(false, true), (true, true), (false, false)] {
+        let mut first = TestPeer::spawn(8233);
+        let mut second = TestPeer::spawn(8234);
+        let (set, _guard) =
+            peer_set_with_peers(&mut [&mut first, &mut second], crate::Config::default());
+        let observed = set.tx_announcers.clone();
+        let (driver, _adverts) =
+            crate::peer_set::driver::spawn(set, zakura_rt::sync::CancellationToken::new());
+        let tx = test_transaction();
+        let id = tx.id();
+        let response = tokio::spawn(driver.clone().oneshot(Request::TransactionsByIdFrom {
+            ids: [id].into(),
+            source: crate::PeerSource::LegacySocket(first.addr),
+        }));
+        assert_eq!(
+            StoragePeers::next_message(&mut first).await,
+            Message::GetData(vec![id.into()])
+        );
+        second
+            .peer_inbound
+            .send(Ok(Message::Inv(vec![id.into()])))
+            .await
+            .unwrap();
+        let advert = second
+            .inbound_service
+            .expect_request(Request::AdvertiseTransactionIds(
+                [id].into(),
+                Some(crate::PeerSource::LegacySocket(second.addr)),
+            ))
+            .await;
+        observed.observe(advert.request());
+        advert.respond(Response::Nil);
+        assert_eq!(second.written_now().await, None);
+        if disconnect {
+            drop(first.peer_inbound);
+        } else {
+            first
+                .peer_inbound
+                .send(Ok(Message::NotFound(vec![id.into()])))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            StoragePeers::next_message(&mut second).await,
+            Message::GetData(vec![id.into()])
+        );
+        if !second_has_body {
+            second
+                .peer_inbound
+                .send(Ok(Message::NotFound(vec![id.into()])))
+                .await
+                .unwrap();
+            assert!(response.await.unwrap().is_err());
+            assert_eq!(second.written_now().await, None);
+            continue;
+        }
+        second
+            .peer_inbound
+            .send(Ok(Message::Tx(tx.clone())))
+            .await
+            .unwrap();
+        assert!(
+            matches!(response.await.unwrap().unwrap(), Response::Transactions(items)
+            if matches!(&items[..], [crate::InventoryResponse::Available((body, _))] if body.id() == id))
+        );
+    }
+}
+
 /// Waiting for an archive peer to serve a block must not delay a transaction that a
 /// ready pruned peer can serve after the advertiser wait expires.
 #[tokio::test(start_paused = true)]

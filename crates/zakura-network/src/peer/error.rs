@@ -70,6 +70,24 @@ where
 }
 
 impl SharedPeerError {
+    /// The transaction was explicitly missing or its connection ended.
+    pub(crate) fn transaction_source_failed(&self) -> bool {
+        match self.0.as_ref() {
+            PeerError::NotFoundResponse(_)
+            | PeerError::ConnectionClosed
+            | PeerError::ConnectionDropped
+            | PeerError::ConnectionTaskExited => true,
+            PeerError::Serialization(SerializationError::Io(error)) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        }
+    }
+
     /// Returns a debug-formatted string describing the inner [`PeerError`].
     pub fn inner_debug(&self) -> String {
         format!("{:?}", self.0.as_ref())

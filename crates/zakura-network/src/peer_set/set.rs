@@ -142,6 +142,7 @@ use crate::{
             next_decision_after, second_request_reason, HeldSecondRequest, SecondResponse,
         },
         stall_tracker::FindResponseStallTracker,
+        tx_retry::{Retry, TxAnnouncers},
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
     },
@@ -233,6 +234,9 @@ where
     /// Provides new and deleted peer [`Change`]s to the peer set,
     /// via the [`Discover`] trait implementation.
     discover: D,
+    pub(super) tx_announcers: TxAnnouncers,
+    tx_retry_sender: tokio_mpsc::Sender<Retry>,
+    tx_retries: tokio_mpsc::Receiver<Retry>,
 
     /// A channel that asks the peer crawler task to connect to more peers.
     demand_signal: mpsc::Sender<MorePeers>,
@@ -411,8 +415,13 @@ where
         minimum_peer_version: MinimumPeerVersion<C>,
         max_conns_per_ip: Option<usize>,
     ) -> Self {
+        let (tx_retry_sender, tx_retries) =
+            tokio_mpsc::channel(config.peerset_total_connection_limit().max(1));
         let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
         Self {
+            tx_announcers: TxAnnouncers::default(),
+            tx_retry_sender,
+            tx_retries,
             // New peers
             discover,
             demand_signal,
@@ -1522,6 +1531,7 @@ where
                 )),
                 _ => None,
             };
+            let download = self.track_transaction(&req, hash, peer);
             let fut = match self.dispatch_inventory(
                 peer,
                 svc,
@@ -1552,7 +1562,7 @@ where
                 }
                 .boxed();
             }
-            return fut.map_err(Into::into).boxed();
+            return self.transaction_response(peer, download, fut);
         }
 
         if !matches!(hash, InventoryHash::Block(_))
@@ -1628,6 +1638,7 @@ where
                 )),
                 _ => None,
             };
+            let download = self.track_transaction(&req, hash, peer);
             let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref(), None) {
                 Ok(fut) => fut,
                 Err(error) => return async { Err(error) }.boxed(),
@@ -1648,7 +1659,7 @@ where
                 }
                 .boxed();
             }
-            return fut.map_err(Into::into).boxed();
+            return self.transaction_response(peer, download, fut);
         }
 
         // Split the synthetic registry-miss by cause so a stall can be diagnosed (the two collapse
@@ -1685,6 +1696,95 @@ where
         }
         .map_err(Into::into)
         .boxed()
+    }
+
+    fn track_transaction(
+        &self,
+        request: &Request,
+        hash: InventoryHash,
+        peer: PeerSocketAddr,
+    ) -> Option<super::tx_retry::Download> {
+        let id = hash.unmined_tx_id()?;
+        let alternate = self
+            .tx_request_source(request, hash)
+            .filter(|addr| *addr != peer)
+            .or_else(|| {
+                self.inventory_registry
+                    .advertising_peers(hash)
+                    .copied()
+                    .find(|addr| *addr != peer)
+            });
+        self.tx_announcers.begin(id, peer, alternate)
+    }
+
+    /// Keep the original response deadline while trying one more known announcer.
+    fn transaction_response(
+        &self,
+        peer: PeerSocketAddr,
+        download: Option<super::tx_retry::Download>,
+        fut: <LoadTrackedClient as Service<Request>>::Future,
+    ) -> <Self as Service<Request>>::Future {
+        if let Some(download) = download {
+            let retries = self.tx_retry_sender.clone();
+            let id = download.id;
+            return async move {
+                let error = match fut.await {
+                    Err(error) if error.transaction_source_failed() => error,
+                    result => return result.map_err(Into::into),
+                };
+                let Some(alternate) = download.alternate() else {
+                    return Err(error.into());
+                };
+                let (reply, response) = tokio::sync::oneshot::channel();
+                if retries
+                    .try_send(Retry {
+                        id,
+                        first: peer,
+                        alternate,
+                        reply,
+                    })
+                    .is_ok()
+                {
+                    if let Ok(second) = response.await {
+                        return second.await.map_err(Into::into);
+                    }
+                }
+                Err(error.into())
+            }
+            .boxed();
+        }
+        fut.map_err(Into::into).boxed()
+    }
+
+    fn poll_transaction_retries(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
+        while let Poll::Ready(Some(retry)) = self.tx_retries.poll_recv(cx) {
+            if retry.reply.is_closed() {
+                continue;
+            }
+            let _ = self.inventory_registry.poll_inventory(cx)?;
+            let hash = InventoryHash::from(retry.id);
+            let alternate = Some(retry.alternate).filter(|peer| {
+                !self
+                    .inventory_registry
+                    .missing_peers(hash)
+                    .any(|missing| missing == peer)
+            });
+            let candidates = self
+                .inventory_registry
+                .advertising_peers(hash)
+                .copied()
+                .chain(alternate)
+                .filter(|peer| *peer != retry.first && self.ready_services.contains_key(peer))
+                .collect();
+            if let Some(peer) = self.select_p2c_peer_from_list(&candidates) {
+                if let Some(mut svc) = self.take_ready_service(&peer) {
+                    let future = svc.call(Request::TransactionsById([retry.id].into()));
+                    self.push_unready(peer, svc);
+                    let _ = retry.reply.send(future.boxed());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns the legacy peer that a transaction request names as the sender of its advert,
@@ -2128,6 +2228,7 @@ where
         let _poll_pending: Poll<()> = self.poll_background_errors(cx)?;
 
         let _ = self.poll_peers(cx)?;
+        self.poll_transaction_retries(cx)?;
         self.prune_block_gossip_peers();
         self.publish_block_gossip_peers();
 

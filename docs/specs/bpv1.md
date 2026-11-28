@@ -120,7 +120,41 @@ enter the existing consensus block-validation path.
 
 A node MUST keep at most one submission of a block in that path at a time. Its
 body claim keeps native block sync off the block from admission until the
-reconstruction deadline. Assembly extends a live claim until a verdict or the
+reconstruction deadline. The node MUST install the claim before it submits the
+header to header admission. Native block sync requests the bodies of the
+headers that header admission publishes, so a later claim can lose that race.
+Metadata that leaves admission without a block slot releases the claim, and
+native block sync then fetches the body at once. When every copy of a block's
+metadata fails its commitment check, no later copy claims the body while the
+block stays in BPv1's window, so repeated bad metadata cannot keep native block
+sync off the block. BPv1 can still deliver the block without a claim.
+
+When native block sync learns a header before BPv1 claims its body, and the
+height lies in BPv1's window (section 2) while BPv1 has a live session, native
+block sync reserves the body for the metadata grace: `2 ×` the median path RTT
+plus `META_GRACE_FLOOR`. `HeaderMeta` that arrives in the grace turns the
+reservation into the claim. Native block sync reserves each block at most once,
+and never reserves a block that it saw claimed, so BPv1 delays a body by at
+most one grace before its claim, and never after a release. A release for any
+reason but the block's commitment to the chain marks the block, so a later
+request is never reserved. A mark keeps the highest height that the node saw
+for the block, capped at the window's top, because a peer's header-sync status
+names the height of its target.
+The node remembers at most 1,024 such blocks, and reserves nothing new at that
+cap. A block that the cap leaves unmarked still stops reservations at or below
+its height until the window moves above that height. A request that native block sync started before any claim or reservation
+runs to completion. Removing an expired claim or reservation wakes every holder
+whose timer waited on it.
+
+A peer with a live BPv1 session sends `HeaderMeta`, which carries the header,
+for each block it admits. So header sync MUST NOT fetch a header in BPv1's
+window from that peer while a claim or reservation on the header's hash is
+live. Header sync's first wait takes the same once-per-hash reservation as
+native block sync, so the header and its body share one grace. Header sync
+fetches the header when the claim is released or the reservation expires. It
+fetches a header from a peer without BPv1 at once.
+
+Assembly extends a live claim until a verdict or the
 verification deadline, which starts at the first submission. It never renews an
 expired claim, because block sync may already fetch the body. When the
 verification deadline passes, the node MUST use the existing block-download
@@ -1516,6 +1550,7 @@ registry.
 | Parameter | Reference value | Meaning and authority |
 | --- | --- | --- |
 | Stall interval; `STALL_BACKOFF` | `SLOW_X` × one part's estimated arrival (decision-22); 2.0 | Recovery; the reconstruction deadline is the only bound (decision-17). |
+| Metadata grace; `META_GRACE_FLOOR` | `2 ×` median path RTT + `META_GRACE_FLOOR`; 250 ms | How long native block sync reserves a body in BPv1's window for its `HeaderMeta`. One round trip for the header and one for the metadata. |
 | Reconstruction deadline | 15 s | Monotonic from metadata admission. |
 | Verification deadline | 120 s | Monotonic from the first verifier submission. The verifier's wait for another delivery's pending commit. |
 | Retention after completion | 5 s, extended until every neighbour reports `BlockDone`, within a 60 s bound | Experimental. |

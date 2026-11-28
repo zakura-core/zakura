@@ -490,6 +490,11 @@ impl ReactorIO {
                     }
                     if let Some(claims) = self.startup.body_claims.as_ref() {
                         let expired = claims.prune_expired(Instant::now()) > 0;
+                        // The query below reads every change so far, so the
+                        // generation this prune bumped needs no second pass.
+                        if let Some(rx) = body_claim_generation.as_mut() {
+                            rx.borrow_and_update();
+                        }
                         // A release or expiry can free a pending height that
                         // selection skipped, so wake the routines.
                         if expired || !matches!(wake, Some(Err(_))) {
@@ -1189,11 +1194,12 @@ impl ReactorIO {
                     && !self
                         .registry
                         .has_outstanding_request(block.height, block.hash)
-                    && !self
-                        .startup
-                        .body_claims
-                        .as_ref()
-                        .is_some_and(|claims| claims.is_claimed(block.hash, now))
+                    // A BPv1 claim, or a reservation for BPv1's metadata,
+                    // holds the body. The claims' expiry timer and release
+                    // wake re-run this query.
+                    && !self.startup.body_claims.as_ref().is_some_and(|claims| {
+                        claims.defer_to_bpv1(block.hash, block.height.0, now)
+                    })
             })
             .collect();
 

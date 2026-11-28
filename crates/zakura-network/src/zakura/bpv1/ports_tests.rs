@@ -18,7 +18,7 @@ use zakura_header_chain::{
 };
 use zakura_node_services::{
     block_memory::DecodedBlockPool,
-    body_claims::SharedBodyClaims,
+    body_claims::{Bpv1Window, SharedBodyClaims},
     header_chain::{ExactHeaderAdmission, PortError},
 };
 use zakura_rt::{sync::watch, time::Instant};
@@ -373,6 +373,114 @@ async fn native_block_sync_fetches_a_bpv1_claimed_hash_once_the_claim_expires() 
             .missing_block_bodies
             .contains(&block::Height(11)),
         "native block sync selects the hash once the claim expires"
+    );
+
+    shutdown.cancel();
+    let _ = task.await;
+}
+
+/// 06 §6: native block sync learns a header in BPv1's window before BPv1
+/// claims its body. It reserves the body for BPv1's metadata grace, then
+/// fetches it once the reservation expires. A header above the window is
+/// fetched at once.
+#[cfg(not(zakura_sim))]
+#[tokio::test]
+async fn native_block_sync_reserves_a_header_in_the_bpv1_window_for_the_grace() {
+    let claims = SharedBodyClaims::new();
+    let fallback_port: &dyn BlockFallbackPort = &claims;
+    let genesis_hash = regtest_genesis_block().hash();
+    let (h1, h2) = (block::Hash([0x11; 32]), block::Hash([0x22; 32]));
+    let grace = Duration::from_millis(500);
+    fallback_port.publish_window(Bpv1Window {
+        low_exclusive: 0,
+        high_inclusive: 11,
+        grace,
+    });
+    fallback_port.set_peer_live(
+        zakura_quic::NodeSecretKey::from_bytes(&[2; 32]).public(),
+        true,
+    );
+
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(10),
+        verified_block_tip: block::Height(10),
+        verified_block_hash: genesis_hash,
+    };
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(12), h2));
+    let pool = DecodedBlockPool::for_block_count(NonZeroU64::new(8).unwrap());
+    let mut startup = BlockSyncStartup::new(
+        frontiers,
+        (block::Height(12), h2),
+        tip_rx,
+        pool,
+        ZakuraBlockSyncConfig::default(),
+    )
+    .with_body_claims(claims.clone());
+    startup.committed_views = Some(crate::zakura::testkit::startup_committed_view(
+        frontiers,
+        (block::Height(12), h2),
+    ));
+    let shutdown = startup.shutdown.clone();
+    let started = Instant::now();
+    let (handle, mut actions, task) =
+        spawn_block_sync_reactor(startup).expect("block sync reactor spawns");
+    let answer = |handle: &crate::zakura::block_sync::BlockSyncHandle| {
+        let meta = |height, hash| BlockSyncBlockMeta {
+            height: block::Height(height),
+            hash,
+            size: BlockSizeEstimate::Confirmed(1_000),
+        };
+        handle
+            .send_control(BlockSyncEvent::NeededBlocks(vec![
+                meta(11, h1),
+                meta(12, h2),
+            ]))
+            .expect("send NeededBlocks");
+    };
+    let mut next_query = async || loop {
+        let action = tokio::time::timeout(Duration::from_secs(2), actions.recv())
+            .await
+            .expect("the reactor queries needed blocks")
+            .expect("action stream open");
+        if matches!(action, BlockSyncAction::QueryNeededBlocks { .. }) {
+            return;
+        }
+    };
+
+    next_query().await;
+    answer(&handle);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let candidates = handle.candidate_state();
+    assert!(
+        !candidates.missing_block_bodies.contains(&block::Height(11)),
+        "native block sync reserves the body at height 11 for BPv1"
+    );
+    assert!(
+        candidates.missing_block_bodies.contains(&block::Height(12)),
+        "height 12 lies above BPv1's window, so native block sync fetches it"
+    );
+    assert!(claims.is_claimed(h1, Instant::now()));
+
+    // No `HeaderMeta` arrives. The reservation's expiry wakes the reactor.
+    loop {
+        next_query().await;
+        answer(&handle);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if handle
+            .candidate_state()
+            .missing_block_bodies
+            .contains(&block::Height(11))
+        {
+            break;
+        }
+    }
+    assert!(
+        started.elapsed() >= grace,
+        "native block sync waits the grace before it fetches height 11"
+    );
+    assert!(
+        !claims.is_claimed(h1, Instant::now()),
+        "native block sync reserves each hash once"
     );
 
     shutdown.cancel();

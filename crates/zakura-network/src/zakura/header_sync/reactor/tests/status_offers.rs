@@ -3074,3 +3074,224 @@ async fn an_earlier_lower_work_offer_waits_behind_a_later_offer_the_pass_serves_
     reactor.schedule_cached_statuses();
     expect_locator_query(&mut actions, &honest, target);
 }
+
+/// Header sync fetches no header in BPv1's window from a BPv1 peer while it
+/// waits for that peer's `HeaderMeta`. A peer without BPv1 is served at
+/// once, and the held offer is staged when its reservation expires.
+#[tokio::test(start_paused = true)]
+async fn a_bpv1_peers_status_waits_for_its_header_meta() {
+    use zakura_node_services::body_claims::{Bpv1Window, SharedBodyClaims};
+
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let claims = SharedBodyClaims::new();
+    let grace = std::time::Duration::from_millis(300);
+    claims.set_bpv1_window(Some(Bpv1Window {
+        low_exclusive: 0,
+        high_inclusive: 16,
+        grace,
+    }));
+    reactor.startup.body_claims = Some(claims.clone());
+    let (bpv1_peer, _bpv1_outbound) = connect(&mut reactor, 0x31);
+    let (plain_peer, _plain_outbound) = connect(&mut reactor, 0x32);
+    claims.set_bpv1_peer([0x31; 32], true);
+    let held = block::Hash([0x41; 32]);
+    let served = block::Hash([0x42; 32]);
+
+    reactor.handle_status(bpv1_peer.clone(), 0, status_for(&snapshot, held));
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the BPv1 peer's header waits for its HeaderMeta"
+    );
+    assert!(
+        claims.is_claimed(held, Instant::now()),
+        "the wait reserves the body too"
+    );
+    let deadline = reactor
+        .bpv1_hold_until()
+        .expect("a held offer wakes at the reservation's expiry");
+
+    reactor.handle_status(plain_peer.clone(), 0, status_for(&snapshot, served));
+    expect_locator_query(&mut actions, &plain_peer, served);
+
+    time::advance(deadline - Instant::now()).await;
+    reactor.end_bpv1_hold();
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &bpv1_peer, held);
+    assert_eq!(
+        reactor.bpv1_hold_until(),
+        None,
+        "a hash is reserved once, so nothing is held after the grace"
+    );
+}
+
+/// A peer without BPv1, or a target outside BPv1's window, is never held.
+#[test]
+fn header_sync_holds_only_a_bpv1_peer_inside_the_window() {
+    use zakura_node_services::body_claims::{Bpv1Window, SharedBodyClaims};
+
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let claims = SharedBodyClaims::new();
+    claims.set_bpv1_window(Some(Bpv1Window {
+        low_exclusive: 5,
+        high_inclusive: 16,
+        grace: std::time::Duration::from_secs(1),
+    }));
+    reactor.startup.body_claims = Some(claims.clone());
+    let (bpv1_peer, _bpv1_outbound) = connect(&mut reactor, 0x33);
+    claims.set_bpv1_peer([0x33; 32], true);
+    let below = block::Hash([0x43; 32]);
+
+    // `status_for` advertises height 2, below the window.
+    reactor.handle_status(bpv1_peer.clone(), 0, status_for(&snapshot, below));
+    expect_locator_query(&mut actions, &bpv1_peer, below);
+    assert!(!claims.is_claimed(below, Instant::now()));
+}
+
+/// A held status supersedes the peer's unstarted target, as every other
+/// offer outcome does, so header sync never answers the stale target.
+#[test]
+fn a_held_status_drops_the_peers_unstarted_target() {
+    use zakura_node_services::body_claims::{Bpv1Window, SharedBodyClaims};
+
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let claims = SharedBodyClaims::new();
+    let window = |low_exclusive| {
+        Some(Bpv1Window {
+            low_exclusive,
+            high_inclusive: 16,
+            grace: std::time::Duration::from_secs(1),
+        })
+    };
+    reactor.startup.body_claims = Some(claims.clone());
+    let (peer, _outbound) = connect(&mut reactor, 0x34);
+    claims.set_bpv1_peer([0x34; 32], true);
+
+    // `status_for` advertises height 2: below the first window, inside the
+    // second.
+    claims.set_bpv1_window(window(5));
+    let first = block::Hash([0x44; 32]);
+    reactor.handle_status(peer.clone(), 0, status_for(&snapshot, first));
+    expect_locator_query(&mut actions, &peer, first);
+    assert!(reactor.peer_work_queue.awaiting_target(&peer).is_some());
+
+    claims.set_bpv1_window(window(0));
+    let held = block::Hash([0x45; 32]);
+    reactor.handle_status(peer.clone(), 0, status_for(&snapshot, held));
+    assert!(claims.is_claimed(held, Instant::now()));
+    assert!(
+        reactor.peer_work_queue.awaiting_target(&peer).is_none(),
+        "the held status superseded the unstarted target"
+    );
+}
+
+/// The running reactor ends a BPv1 hold on its own: when BPv1 releases the
+/// claim, and when the reservation expires.
+#[tokio::test(start_paused = true)]
+async fn the_running_reactor_wakes_a_bpv1_hold_on_release_and_on_expiry() {
+    use zakura_node_services::body_claims::{BodyClaimRelease, Bpv1Window, SharedBodyClaims};
+
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let claims = SharedBodyClaims::new();
+    let grace = std::time::Duration::from_secs(10);
+    claims.set_bpv1_window(Some(Bpv1Window {
+        low_exclusive: 0,
+        high_inclusive: 16,
+        grace,
+    }));
+    startup.body_claims = Some(claims.clone());
+    let (handle, mut actions, _task) =
+        spawn_header_sync_reactor(startup).expect("the reactor starts");
+    let mut sessions = Vec::new();
+    let mut connect = |byte: u8| {
+        let peer =
+            ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has the required length");
+        claims.set_bpv1_peer([byte; 32], true);
+        let (send, outbound) = framed_channel(8);
+        sessions.push(outbound);
+        (
+            peer.clone(),
+            PeerSession::from_parts(peer, send, CancellationToken::new()),
+        )
+    };
+    let settle = || async {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    };
+
+    // BPv1 releases the claim on the held target: header sync fetches it at once.
+    let (released_peer, session) = connect(0x34);
+    handle
+        .send(Event::PeerConnected(session))
+        .await
+        .expect("the peer connects");
+    let released = block::Hash([0x44; 32]);
+    let start = Instant::now();
+    handle
+        .send(Event::Status {
+            peer: released_peer.clone(),
+            session_id: 0,
+            status: status_for(&snapshot, released),
+        })
+        .await
+        .expect("the status reaches the reactor");
+    settle().await;
+    assert!(
+        actions.try_recv().is_err(),
+        "the header waits for HeaderMeta"
+    );
+    assert!(claims.claim_at(released, start + grace, Instant::now()));
+    claims.release(released, BodyClaimRelease::Fallback);
+    match actions.recv().await {
+        Some(HeaderPortOperation::QueryHeaderLocator {
+            peer,
+            target_tip_hash,
+            ..
+        }) => {
+            assert_eq!((peer, target_tip_hash), (released_peer, released));
+        }
+        other => panic!("expected the released target's locator query, got {other:?}"),
+    }
+    assert!(
+        Instant::now() < start + grace,
+        "the release, not the grace, woke it"
+    );
+
+    // No HeaderMeta arrives: header sync fetches the header when the grace ends.
+    let (expired_peer, session) = connect(0x35);
+    handle
+        .send(Event::PeerConnected(session))
+        .await
+        .expect("the peer connects");
+    let expired = block::Hash([0x45; 32]);
+    let start = Instant::now();
+    handle
+        .send(Event::Status {
+            peer: expired_peer.clone(),
+            session_id: 0,
+            status: status_for(&snapshot, expired),
+        })
+        .await
+        .expect("the status reaches the reactor");
+    settle().await;
+    assert!(
+        actions.try_recv().is_err(),
+        "the header waits for HeaderMeta"
+    );
+    match actions.recv().await {
+        Some(HeaderPortOperation::QueryHeaderLocator {
+            peer,
+            target_tip_hash,
+            ..
+        }) => {
+            assert_eq!((peer, target_tip_hash), (expired_peer, expired));
+        }
+        other => panic!("expected the expired target's locator query, got {other:?}"),
+    }
+    assert!(Instant::now() >= start + grace, "the grace ended the hold");
+}

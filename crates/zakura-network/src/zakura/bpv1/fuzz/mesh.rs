@@ -1476,6 +1476,10 @@ impl Mesh {
                 admitted.block_id
             ),
             BlockOutput::PublishRetire { block_id, .. } => n.retired.push(*block_id),
+            BlockOutput::AdmitHeader { block_id, .. } => assert!(
+                n.claimed.contains(block_id),
+                "{MESH}: 06 §6 node {node} admitted a header before its body claim"
+            ),
             BlockOutput::ClaimBody { block_id, .. } => {
                 if !n.claimed.contains(block_id) {
                     n.claimed.push(*block_id);

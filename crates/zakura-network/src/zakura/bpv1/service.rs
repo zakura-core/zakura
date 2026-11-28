@@ -328,10 +328,20 @@ impl SharedNode {
         }
     }
 
+    /// Publishes `table`'s window to native block sync and header sync if a
+    /// step moved it or changed its grace. Both read the window when they
+    /// react to a header, so it moves before the step's outputs run.
+    fn publish_window_change(&self, table: &mut BlockTable) {
+        if let Some(window) = table.take_window_change() {
+            self.fallback.publish_window(window);
+        }
+    }
+
     fn apply_block_input(self: &Arc<Self>, input: BlockInput) {
         let step = {
             let mut table = self.lock_table();
             let step = table.step(Instant::now(), input);
+            self.publish_window_change(&mut table);
             metrics::gauge!("zakura.p2p.bpv1.pending_meta.count")
                 .set(table.pending_meta_len() as f64);
             metrics::gauge!("zakura.p2p.bpv1.path.entries").set(table.paths().len() as f64);
@@ -1048,6 +1058,7 @@ impl Service for Bpv1Service {
             if let Some(prev) = sessions.insert(peer_node, live) {
                 prev.cancel.cancel();
             }
+            self.node.fallback.set_peer_live(peer_node, true);
             (session_gen, snapshot)
         };
 
@@ -1091,6 +1102,7 @@ impl Service for Bpv1Service {
             if let Some(sess) = sessions.remove(&peer_node) {
                 sess.cancel.cancel();
             }
+            self.node.fallback.set_peer_live(peer_node, false);
         }
     }
 }
@@ -1199,14 +1211,17 @@ async fn run_bpv1_driver(
                             let sessions = node.lock_sessions();
                             let peer_states =
                                 sessions.values().map(|s| *lock(&s.snapshot)).collect();
-                            node.lock_table().step(
+                            let mut table = node.lock_table();
+                            let step = table.step(
                                 Instant::now(),
                                 BlockInput::SessionEnded {
                                     peer: peer_node,
                                     session_gen,
                                     peer_states,
                                 },
-                            )
+                            );
+                            node.publish_window_change(&mut table);
+                            step
                         };
                         node.dispatch_block_step(step);
                     }
@@ -1238,6 +1253,8 @@ async fn run_bpv1_driver(
                             ));
                         }
                     }
+                    // New round trips change the grace.
+                    node.publish_window_change(&mut table);
                     metrics::gauge!("zakura.p2p.bpv1.path.entries")
                         .set(table.paths().len() as f64);
                     metrics::gauge!("zakura.p2p.bpv1.path.unmeasured_peers")
@@ -2128,6 +2145,7 @@ async fn run_peer_routine(
             .is_some_and(|s| s.conn_id == conn_id && s.session_gen == session_gen)
         {
             sessions.remove(&peer_node);
+            node.fallback.set_peer_live(peer_node, false);
         }
     }
     // `SessionEnded` releases every claim and pending push of this session,

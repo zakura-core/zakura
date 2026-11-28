@@ -29,8 +29,8 @@ use super::{
     profile::{Coding, Profile},
     proposer::*,
     test_support::{
-        admit_meta, admit_work, build_v6_coinbase, commit_work, make_envelope, node_id, Adversary,
-        LinkProfile, MachineMesh, TEST_TIP_HASH,
+        admit_meta, admit_work, assert_claim_precedes_admission, build_v6_coinbase, commit_work,
+        make_envelope, node_id, Adversary, LinkProfile, MachineMesh, TEST_TIP_HASH,
     },
     tree::VerifiedPart,
     unknown_parent::UnknownParentVerdict,
@@ -1970,13 +1970,24 @@ fn local_admission_during_a_peer_copy_check_keeps_the_solved_block() {
             parent_hash: TEST_TIP_HASH,
         },
     );
-    let _ = table.step(
+    let local = table.step(
         now,
         BlockInput::BlockAdmittedLocal {
             height: 1,
             envelope: envelope(),
             parts: encoded.parts.clone(),
         },
+    );
+    assert!(
+        local.outputs.iter().any(|o| matches!(
+            o,
+            BlockOutput::ReleaseBodyClaim {
+                block_id: released,
+                reason: ClaimRelease::Committed,
+            } if *released == block_id
+        )),
+        "local admission ends the peer copy's claim: {:?}",
+        local.outputs
     );
     let late = commitment_ok(&mut table, now, &checking);
     table.assert_invariants();
@@ -4579,7 +4590,8 @@ fn offer(
     )
 }
 
-/// [`offer`] for a header whose parent is `parent_hash`.
+/// [`offer`] for a header whose parent is `parent_hash`. Returns the effects
+/// of every admission step, in order.
 fn offer_child(
     table: &mut BlockTable,
     now: Instant,
@@ -4606,13 +4618,16 @@ fn offer_child(
             parent_hash,
         },
     );
+    let mut offered = received;
     let Some(work_id) = admitted.outputs.iter().find_map(|o| match o {
         BlockOutput::VerifyCommitment { work_id, .. } => Some(*work_id),
         _ => None,
     }) else {
-        return admitted;
+        merge_step(&mut offered, admitted);
+        return offered;
     };
-    table.step(
+    merge_step(&mut offered, admitted);
+    let checked = table.step(
         now,
         BlockInput::CommitmentChecked {
             work_id,
@@ -4620,7 +4635,15 @@ fn offer_child(
             peers: Vec::new(),
             rng_seed: 7,
         },
-    )
+    );
+    merge_step(&mut offered, checked);
+    offered
+}
+
+/// Appends `next`'s events and outputs to `step`, in order.
+fn merge_step(step: &mut BlockStep, next: BlockStep) {
+    step.events.extend(next.events);
+    step.outputs.extend(next.outputs);
 }
 
 fn was_admitted(step: &BlockStep, block_id: block::Hash) -> bool {
@@ -4645,7 +4668,7 @@ fn bpv1_44_the_body_claim_covers_verification() {
             hash: TEST_TIP_HASH,
         },
     );
-    let admitted = admit_block(
+    let admitted = offer(
         &mut table,
         t0,
         block_id,
@@ -4938,7 +4961,7 @@ fn bpv1_84_a_retryable_verdict_keeps_the_body_until_the_parent_commits() {
             hash: TEST_TIP_HASH,
         },
     );
-    let admitted = admit_block(
+    let admitted = offer(
         &mut table,
         t0,
         block_id,
@@ -5110,7 +5133,7 @@ fn bpv1_44_a_late_assembly_does_not_reclaim_an_expired_body() {
             hash: TEST_TIP_HASH,
         },
     );
-    let admitted = admit_block(
+    let admitted = offer(
         &mut table,
         t0,
         block_id,
@@ -5233,4 +5256,253 @@ fn bpv1_84_a_tip_on_another_branch_falls_back_a_parked_block() {
         reason: FallbackReason::LocalCapacity,
     }));
     table.assert_invariants();
+}
+
+/// 06 §6: metadata claims its body before headerchain sees the header, and
+/// every way it leaves admission without a slot releases the claim, so native
+/// block sync fetches the body at once.
+#[test]
+fn every_admission_exit_releases_the_early_claim() {
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let root = [0x5A; 32];
+    let release_of = |step: &BlockStep, id: block::Hash| {
+        step.outputs.iter().find_map(|o| match o {
+            BlockOutput::ReleaseBodyClaim { block_id, reason } if *block_id == id => Some(*reason),
+            _ => None,
+        })
+    };
+    let start = |table: &mut BlockTable, claims: &SharedBodyClaims, id: block::Hash| {
+        let received = receive(table, t0, make_envelope(id, coding, root, node_id(1)));
+        assert_claim_precedes_admission(&received, id);
+        apply_claims(claims, t0, &received);
+        assert!(
+            claims.is_claimed(id, t0),
+            "the claim is live during admission"
+        );
+        received
+    };
+    let admitted_at = |height| HeaderAdmissionResult::Admitted {
+        height,
+        parent_hash: TEST_TIP_HASH,
+    };
+
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 9,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let claims = SharedBodyClaims::new();
+    let cases: [(u8, HeaderAdmissionResult, ClaimRelease); 4] = [
+        (
+            0xC1,
+            admitted_at(9 + PROPAGATION_DEPTH + 1),
+            ClaimRelease::Fallback,
+        ),
+        (
+            0xC2,
+            HeaderAdmissionResult::PeerInvalid,
+            ClaimRelease::Retired,
+        ),
+        (
+            0xC3,
+            HeaderAdmissionResult::LocalError,
+            ClaimRelease::Fallback,
+        ),
+        (
+            0xC4,
+            HeaderAdmissionResult::MissingParent {
+                parent_hash: block::Hash([0xEE; 32]),
+            },
+            ClaimRelease::Fallback,
+        ),
+    ];
+    for (byte, result, reason) in cases {
+        let id = block::Hash([byte; 32]);
+        let received = start(&mut table, &claims, id);
+        let ended = header_result(&mut table, t0, &received, result);
+        apply_claims(&claims, t0, &ended);
+        assert_eq!(release_of(&ended, id), Some(reason), "block {byte:#x}");
+        assert!(!claims.is_claimed(id, t0), "block {byte:#x}");
+        table.assert_invariants();
+    }
+
+    // A failed commitment with no other copy releases the claim, and no later
+    // copy claims the body again.
+    let id = block::Hash([0xC5; 32]);
+    let received = start(&mut table, &claims, id);
+    let checking = header_result(&mut table, t0, &received, admitted_at(10));
+    let failed = table.step(
+        t0,
+        BlockInput::CommitmentChecked {
+            work_id: commit_work(&checking),
+            ok: false,
+            peers: Vec::new(),
+            rng_seed: 0,
+        },
+    );
+    apply_claims(&claims, t0, &failed);
+    assert_eq!(
+        release_of(&failed, id),
+        Some(ClaimRelease::FailedCommitment)
+    );
+    assert!(!claims.is_claimed(id, t0));
+
+    // Block sync committed the block while its commitment check ran.
+    let id = block::Hash([0xC7; 32]);
+    let received = start(&mut table, &claims, id);
+    let checking = header_result(&mut table, t0, &received, admitted_at(10));
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 10,
+            hash: id,
+        },
+    );
+    let committed = commitment_ok(&mut table, t0, &checking);
+    apply_claims(&claims, t0, &committed);
+    assert_eq!(release_of(&committed, id), Some(ClaimRelease::Committed));
+    assert!(!claims.is_claimed(id, t0));
+    table.assert_invariants();
+
+    // The window moved past the block while its commitment check ran. The
+    // move would end the later cases' window, so it runs on its own table.
+    let mut moved = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    moved.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 9,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let id = block::Hash([0xC8; 32]);
+    let received = start(&mut moved, &claims, id);
+    let checking = header_result(&mut moved, t0, &received, admitted_at(10));
+    moved.step(
+        t0,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0xB8; 32]),
+            height: 10 + PROPAGATION_DEPTH,
+        },
+    );
+    let passed = commitment_ok(&mut moved, t0, &checking);
+    apply_claims(&claims, t0, &passed);
+    assert_eq!(release_of(&passed, id), Some(ClaimRelease::Fallback));
+    assert!(!claims.is_claimed(id, t0));
+    moved.assert_invariants();
+
+    // An admitted block keeps the claim, extended to its reconstruction
+    // deadline.
+    let id = block::Hash([0xC6; 32]);
+    let received = start(&mut table, &claims, id);
+    let checking = header_result(&mut table, t0, &received, admitted_at(10));
+    let at = t0 + Duration::from_millis(5);
+    let admitted = commitment_ok(&mut table, at, &checking);
+    apply_claims(&claims, at, &admitted);
+    assert!(was_admitted(&admitted, id));
+    assert_eq!(release_of(&admitted, id), None);
+    assert_eq!(claims.next_expiry(), Some(at + RECONSTRUCTION_DEADLINE));
+    table.assert_invariants();
+}
+
+/// A block that passes its commitment check while every slot is busy
+/// releases its early claim, so native block sync fetches it at once.
+#[test]
+fn a_block_without_a_slot_releases_its_early_claim() {
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let root = [0x5A; 32];
+    let mut config = BlockConfig::for_profile(Profile::TINY);
+    config.max_concurrent_blocks = 1;
+    let mut table = BlockTable::new(config);
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 9,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let claims = SharedBodyClaims::new();
+    let admitted_at = |height| HeaderAdmissionResult::Admitted {
+        height,
+        parent_hash: TEST_TIP_HASH,
+    };
+    let admit = |table: &mut BlockTable, byte: u8, height: u32| {
+        let id = block::Hash([byte; 32]);
+        let received = receive(table, t0, make_envelope(id, coding, root, node_id(1)));
+        apply_claims(&claims, t0, &received);
+        let checking = header_result(table, t0, &received, admitted_at(height));
+        let checked = commitment_ok(table, t0, &checking);
+        apply_claims(&claims, t0, &checked);
+        (id, checked)
+    };
+
+    let (first, holds_slot) = admit(&mut table, 0xD1, 10);
+    assert!(was_admitted(&holds_slot, first));
+    let (second, refused) = admit(&mut table, 0xD2, 11);
+    assert!(!was_admitted(&refused, second));
+    assert!(
+        refused.outputs.iter().any(|o| matches!(
+            o,
+            BlockOutput::ReleaseBodyClaim { block_id, reason: ClaimRelease::Fallback }
+                if *block_id == second
+        )),
+        "the refused block releases its claim"
+    );
+    assert!(!claims.is_claimed(second, t0));
+    assert!(claims.is_claimed(first, t0));
+    table.assert_invariants();
+}
+
+/// 06 §6: the window BPv1 publishes to native block sync is its admission
+/// window, `(top - PROPAGATION_DEPTH, verified + PROPAGATION_DEPTH]`, and the
+/// grace is two median round trips plus the floor.
+#[test]
+fn the_published_window_is_the_admission_window() {
+    let t0 = Instant::now();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let first = table
+        .take_window_change()
+        .expect("the first call publishes");
+    assert_eq!(first.grace, META_GRACE_FLOOR, "no measured path yet");
+    assert_eq!(table.take_window_change(), None, "nothing changed");
+
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 100,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    table.step(
+        t0,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0xB0; 32]),
+            height: 110,
+        },
+    );
+    observe(&mut table, t0, node_id(3), 80, 1_000_000);
+    let window = table.take_window_change().expect("the window moved");
+    assert_eq!(window.low_exclusive, 110 - PROPAGATION_DEPTH);
+    assert_eq!(window.high_inclusive, 100 + PROPAGATION_DEPTH);
+    assert_eq!(
+        window.grace,
+        Duration::from_millis(160) + META_GRACE_FLOOR,
+        "two median round trips plus the floor"
+    );
+    for height in [110 - PROPAGATION_DEPTH, 100 + PROPAGATION_DEPTH + 1] {
+        assert!(
+            !table.would_admit_height(height),
+            "height {height} is outside the window"
+        );
+    }
+    for height in [110 - PROPAGATION_DEPTH + 1, 100 + PROPAGATION_DEPTH] {
+        assert!(
+            table.would_admit_height(height),
+            "height {height} is inside the window"
+        );
+    }
 }

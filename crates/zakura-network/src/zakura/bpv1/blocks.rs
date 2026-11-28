@@ -11,6 +11,7 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use zakura_chain::block;
+use zakura_node_services::body_claims::Bpv1Window;
 use zakura_quic::NodeId;
 use zakura_rt::{
     collections::{HashMap, HashSet},
@@ -68,6 +69,12 @@ pub const RECONSTRUCTION_DEADLINE: Duration = Duration::from_secs(15);
 /// commit, and the node's verifier adapter cancels its router call at the same
 /// bound.
 pub const VERIFY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The fixed part of how long native block sync waits for BPv1's
+/// `HeaderMeta` after it learns a header in BPv1's window. The grace is
+/// `2 × median RTT + META_GRACE_FLOOR`: one round trip for the header to
+/// reach this node and one for the metadata, plus local scheduling.
+pub const META_GRACE_FLOOR: Duration = Duration::from_millis(250);
 
 /// Maximum metadata entries in header admission or the commitment check.
 /// Pending metadata never counts here (`bpv1-75`).
@@ -246,6 +253,9 @@ pub enum ClaimRelease {
     Repair,
     /// Retired / consensus-invalid / evicted.
     Retired,
+    /// Every copy of the metadata failed its commitment check. Block sync
+    /// fetches the body, and no later copy claims it again.
+    FailedCommitment,
 }
 
 /// Decoded `HeaderMeta` envelope presented to [`BlockTable`].
@@ -1483,6 +1493,14 @@ impl ActiveBlock {
     }
 }
 
+/// Releases the body claim that metadata took when it entered admission
+/// (06 §6). Every admitting entry holds one, until it becomes an admitted
+/// block or leaves admission.
+fn release_admission_claim(step: &mut BlockStep, block_id: block::Hash, reason: ClaimRelease) {
+    step.outputs
+        .push(BlockOutput::ReleaseBodyClaim { block_id, reason });
+}
+
 /// Tells the peer that delivered `block_id`'s `HeaderMeta` that it was
 /// rejected or expired without fault.
 fn reject_meta(step: &mut BlockStep, block_id: block::Hash, peer: NodeId, session_gen: u64) {
@@ -1587,6 +1605,8 @@ pub struct BlockTable {
     /// entry's admission or checks wakes nothing for it, so the entry retries
     /// admission instead of parking.
     best_moves: u64,
+    /// The window [`Self::take_window_change`] last returned.
+    published_window: Option<Bpv1Window>,
 }
 
 impl BlockTable {
@@ -1605,7 +1625,35 @@ impl BlockTable {
             pending_bytes: 0,
             blocks: HashMap::new(),
             best_moves: 0,
+            published_window: None,
         }
+    }
+
+    /// The heights whose bodies BPv1 may fetch, and how long native block
+    /// sync reserves a body there for BPv1's metadata.
+    pub fn window(&self) -> Bpv1Window {
+        Bpv1Window {
+            // bpv1-7: strictly above `top - PROPAGATION_DEPTH`.
+            low_exclusive: self.top.saturating_sub(PROPAGATION_DEPTH),
+            // bpv1-76: at most `PROPAGATION_DEPTH` above the verified tip.
+            high_inclusive: self.verified.saturating_add(PROPAGATION_DEPTH),
+            grace: self
+                .paths
+                .median_rtt()
+                .saturating_mul(2)
+                .saturating_add(META_GRACE_FLOOR),
+        }
+    }
+
+    /// Returns [`Self::window`] if it changed since the last call. The IO
+    /// shell publishes it to native block sync before it runs the step's
+    /// outputs.
+    pub fn take_window_change(&mut self) -> Option<Bpv1Window> {
+        let window = self.window();
+        (self.published_window != Some(window)).then(|| {
+            self.published_window = Some(window);
+            window
+        })
     }
 
     /// Current known chain tip height.
@@ -1785,7 +1833,7 @@ impl BlockTable {
             BlockInput::ParentAdmitted { hash, height } => {
                 self.best_moves = self.best_moves.wrapping_add(1);
                 self.raise_top(height, &mut step);
-                self.wake_pending(hash, &mut step);
+                self.wake_pending(now, hash, &mut step);
             }
             BlockInput::MetaReceived {
                 envelope,
@@ -1979,6 +2027,13 @@ impl BlockTable {
             && height <= self.verified.saturating_add(PROPAGATION_DEPTH)
     }
 
+    /// [`Self::admissible_height`], for tests that check it against
+    /// [`Self::window`].
+    #[cfg(test)]
+    pub(super) fn would_admit_height(&self, height: u32) -> bool {
+        self.admissible_height(height)
+    }
+
     fn handle_meta_received(
         &mut self,
         arrived_at: Instant,
@@ -2032,6 +2087,7 @@ impl BlockTable {
         }
         self.start_admission(
             arrived_at,
+            arrived_at,
             envelope,
             sender,
             LaterCopies::default(),
@@ -2052,11 +2108,13 @@ impl BlockTable {
         }
     }
 
-    /// Queues headerchain admission for `envelope`, which `from` sent first,
-    /// with the copies `later` that other sessions sent. `parked_at` is when
-    /// a woken pending entry first parked.
+    /// Claims the body of `envelope`, which `from` sent first, and queues
+    /// headerchain admission for it, with the copies `later` that other
+    /// sessions sent. `parked_at` is when a woken pending entry first parked.
+    #[allow(clippy::too_many_arguments)]
     fn start_admission(
         &mut self,
+        now: Instant,
         arrived_at: Instant,
         envelope: Box<MetaEnvelope>,
         from: (NodeId, u64),
@@ -2117,6 +2175,16 @@ impl BlockTable {
             },
         );
         self.work_to_block.insert(work_id, block_id);
+        // 06 §6: claim the body before headerchain sees the header. Native
+        // block sync requests the bodies of the headers headerchain
+        // publishes, so a claim installed after admission loses that race.
+        // The shell runs outputs in order. The claim lasts at most the
+        // reconstruction deadline, so a stalled admission cannot pin the
+        // body.
+        step.outputs.push(BlockOutput::ClaimBody {
+            block_id,
+            deadline: now + RECONSTRUCTION_DEADLINE,
+        });
         step.outputs.push(BlockOutput::AdmitHeader {
             work_id,
             block_id,
@@ -2153,6 +2221,7 @@ impl BlockTable {
                 // the best header-valid height, and local solved blocks raise `top`.
                 if !self.admissible_height(height) {
                     if let Some(removed) = self.admitting.remove(&block_id) {
+                        release_admission_claim(step, block_id, ClaimRelease::Fallback);
                         reject_meta(step, block_id, removed.from_peer, removed.session_gen);
                         reject_later(step, block_id, &removed.later);
                     }
@@ -2179,6 +2248,9 @@ impl BlockTable {
                 });
             }
             HeaderAdmissionResult::MissingParent { parent_hash } => {
+                // Headerchain lacks the parent, so native block sync cannot
+                // fetch this body either. A retry claims it again.
+                release_admission_claim(step, block_id, ClaimRelease::Fallback);
                 if let Some(parked_at) = entry.parked_at {
                     let entry = self
                         .admitting
@@ -2225,6 +2297,7 @@ impl BlockTable {
                     .admitting
                     .remove(&block_id)
                     .expect("admitting entry verified present");
+                release_admission_claim(step, block_id, ClaimRelease::Retired);
                 // `block_id` is the hash of the header bytes, so every later
                 // session sent this same invalid header, whatever its binding.
                 for (peer, session_gen) in std::iter::once((entry.from_peer, entry.session_gen))
@@ -2239,6 +2312,7 @@ impl BlockTable {
             }
             HeaderAdmissionResult::LocalError => {
                 if let Some(removed) = self.admitting.remove(&block_id) {
+                    release_admission_claim(step, block_id, ClaimRelease::Fallback);
                     reject_meta(step, block_id, removed.from_peer, removed.session_gen);
                     reject_later(step, block_id, &removed.later);
                 }
@@ -2272,6 +2346,7 @@ impl BlockTable {
                     .remove_pending(block_id)
                     .expect("pending entry verified present");
                 self.start_admission(
+                    now,
                     entry.arrived_at,
                     entry.envelope,
                     (entry.from_peer, entry.session_gen),
@@ -2328,6 +2403,7 @@ impl BlockTable {
     ) {
         if retries_admission(entry.best_moves, self.best_moves, parked_at, now) {
             self.start_admission(
+                now,
                 entry.arrived_at,
                 entry.envelope,
                 (entry.from_peer, entry.session_gen),
@@ -2478,7 +2554,7 @@ impl BlockTable {
     /// child, so the best header can move straight past the parent to the
     /// child. The child's own entry then wakes, and its admission reports it
     /// already known.
-    fn wake_pending(&mut self, best: block::Hash, step: &mut BlockStep) {
+    fn wake_pending(&mut self, now: Instant, best: block::Hash, step: &mut BlockStep) {
         let ready: Vec<block::Hash> = self
             .pending
             .iter()
@@ -2489,6 +2565,7 @@ impl BlockTable {
         for block_id in ready {
             if let Some(pending) = self.remove_pending(block_id) {
                 self.start_admission(
+                    now,
                     pending.arrived_at,
                     pending.envelope,
                     (pending.from_peer, pending.session_gen),
@@ -2532,6 +2609,7 @@ impl BlockTable {
         // published the block to every session, so this copy ends here.
         // Admitting it again would replace the solved block's entry.
         if self.blocks.contains_key(&block_id) {
+            release_admission_claim(step, block_id, ClaimRelease::Committed);
             return;
         }
 
@@ -2539,6 +2617,7 @@ impl BlockTable {
         // Recheck the window after async commitment work
         // in case `top` advanced while commitment verification was running.
         if !self.admissible_height(height) {
+            release_admission_claim(step, block_id, ClaimRelease::Fallback);
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
             reject_later(step, block_id, &entry.later);
             return;
@@ -2548,6 +2627,7 @@ impl BlockTable {
         // retired record: every session then drops its later parts instead of
         // holding them as early data, and no later copy admits it.
         if self.verified_hash == Some(block_id) {
+            release_admission_claim(step, block_id, ClaimRelease::Committed);
             let mut block =
                 ActiveBlock::from_envelope(entry.envelope, height, now, entry.arrived_at, false);
             block.phase = BlockPhase::Retired;
@@ -2567,6 +2647,7 @@ impl BlockTable {
         if !self.evict_for_slot(false, step)
             && !(next && self.displace_for_next_block(height, step))
         {
+            release_admission_claim(step, block_id, ClaimRelease::Fallback);
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
             reject_later(step, block_id, &entry.later);
             return;
@@ -2599,12 +2680,12 @@ impl BlockTable {
         step.events
             .push(BlockEvent::CommitmentVerified { block_id });
         step.events.push(BlockEvent::BlockAdmitted { block_id });
-        // 06 §6: claim the body before publishing `BlockAdmitted`. The shell
-        // runs outputs in order, so no peer sees `BlockAdmitted` first. Native
-        // block sync may have queued the height from its header already. Its
-        // selection and writer-start checks skip the claimed body.
+        // 06 §6: the claim from `start_admission` now runs to the
+        // reconstruction deadline, before any peer sees `BlockAdmitted`. If
+        // it expired during admission, it stays gone: native block sync may
+        // already own the body.
         step.outputs
-            .push(BlockOutput::ClaimBody { block_id, deadline });
+            .push(BlockOutput::ExtendBodyClaim { block_id, deadline });
         step.outputs.push(BlockOutput::PublishAdmitted { admitted });
         // An empty body has no stripes, so the block assembles from
         // `HeaderMeta` alone and no part crosses the wire for it.
@@ -2636,6 +2717,10 @@ impl BlockTable {
             &mut later,
             step,
         ) else {
+            // No copy is left to check, so block sync fetches the body. A
+            // later copy can carry another bad binding, so it claims nothing.
+            // An alternate keeps the claim while its own check runs.
+            release_admission_claim(step, block_id, ClaimRelease::FailedCommitment);
             return;
         };
         let (from_peer, session_gen) = promote_alternate(senders, &mut later);
@@ -2865,6 +2950,13 @@ impl BlockTable {
         }
         let admitted = active.admitted();
         self.blocks.insert(block_id, active);
+        // A peer's copy still in admission ends here, with its body claim.
+        // This node holds the body, so block sync needs no wake. The copy's
+        // pending work then finds no entry and does nothing (bpv1-50).
+        if let Some(copy) = self.admitting.remove(&block_id) {
+            self.work_to_block.remove(&copy.work_id);
+            release_admission_claim(step, block_id, ClaimRelease::Committed);
+        }
         step.events.push(BlockEvent::BlockAdmitted { block_id });
         step.outputs.push(BlockOutput::PublishAdmitted { admitted });
         // decision-20: the proposer announces nothing. Its `BlockDone` tells

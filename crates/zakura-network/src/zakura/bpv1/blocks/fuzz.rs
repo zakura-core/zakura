@@ -548,10 +548,18 @@ fn step(
         let issued = match output {
             BlockOutput::AdmitHeader {
                 work_id, block_id, ..
-            } => blocks
-                .iter()
-                .position(|blk| blk.id == block_id)
-                .map(|block| (work_id, Work::Header { block })),
+            } => {
+                // 06 §6: the body claim precedes the header's admission, so
+                // native block sync never sees the header unclaimed.
+                assert!(
+                    ledger.claimed.contains(&block_id),
+                    "{BLOCK_REPLAY}: header of {block_id:?} admitted before its body claim"
+                );
+                blocks
+                    .iter()
+                    .position(|blk| blk.id == block_id)
+                    .map(|block| (work_id, Work::Header { block }))
+            }
             BlockOutput::CheckUnknownParent { work_id, .. } => Some((work_id, Work::UnknownParent)),
             BlockOutput::VerifyCommitment { work_id, .. } => Some((work_id, Work::Commitment)),
             BlockOutput::StartStripeJob {

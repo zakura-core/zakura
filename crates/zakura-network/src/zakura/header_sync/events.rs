@@ -61,6 +61,10 @@ pub struct HeaderSyncStartup {
     pub trace: ZakuraTrace,
     /// Shared shutdown signal.
     pub shutdown: CancellationToken,
+    /// BPv1's body claims, shared with BPv1 and native block sync. With them,
+    /// header sync waits for a BPv1 peer's `HeaderMeta` before it fetches a
+    /// header in BPv1's window from that peer.
+    pub body_claims: Option<zakura_node_services::body_claims::SharedBodyClaims>,
     /// Private fatal notifications consumed by the node root.
     pub(crate) fatal_events: Option<mpsc::UnboundedSender<HeaderSyncFatalEvent>>,
     /// Receives the reactor's events in test and simulator builds.
@@ -104,6 +108,7 @@ impl HeaderSyncStartup {
             status_refresh_interval,
             trace: ZakuraTrace::noop(),
             shutdown: CancellationToken::new(),
+            body_claims: None,
             fatal_events: None,
             #[cfg(any(test, zakura_sim))]
             observer: super::observe::ObserverSlot::default(),

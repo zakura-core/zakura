@@ -13,7 +13,7 @@ use zakura_chain::block::{self, Block, Header};
 use zakura_header_chain::{BodyVerificationClass, SourceId};
 use zakura_node_services::{
     block_memory::{Admission, AdmissionFailure, DecodedBlockPool, OwnedBlock},
-    body_claims::{BodyClaimRelease, SharedBodyClaims},
+    body_claims::{BodyClaimRelease, Bpv1Window, SharedBodyClaims},
     header_chain::{ExactHeaderAdmission, Port as HeaderChainPort, PortError},
 };
 use zakura_quic::NodeId;
@@ -212,6 +212,16 @@ pub trait BlockFallbackPort: Send + Sync + 'static {
     /// Releases `hash` with `reason`. `ClaimRelease::Fallback` and
     /// `ClaimRelease::Repair` wake native block sync.
     fn release(&self, hash: block::Hash, reason: ClaimRelease) -> bool;
+
+    /// Publishes the heights whose bodies BPv1 may fetch. Native block sync
+    /// reserves a body there for BPv1's `HeaderMeta` when it learns the
+    /// header first.
+    fn publish_window(&self, window: Bpv1Window);
+
+    /// Records whether `peer` has a live BPv1 session. Header sync holds a
+    /// header for BPv1 only from such a peer, and nothing is reserved while
+    /// no peer has one.
+    fn set_peer_live(&self, peer: NodeId, live: bool);
 }
 
 /// The body claims BPv1 shares with native `block_sync`.
@@ -231,7 +241,16 @@ impl BlockFallbackPort for SharedBodyClaims {
             // (decision-22), as a fallback does.
             ClaimRelease::Fallback | ClaimRelease::Repair => BodyClaimRelease::Fallback,
             ClaimRelease::Retired => BodyClaimRelease::Retired,
+            ClaimRelease::FailedCommitment => BodyClaimRelease::FailedMeta,
         };
         SharedBodyClaims::release(self, hash, mapped)
+    }
+
+    fn publish_window(&self, window: Bpv1Window) {
+        self.set_bpv1_window(Some(window));
+    }
+
+    fn set_peer_live(&self, peer: NodeId, live: bool) {
+        self.set_bpv1_peer(*peer.as_bytes(), live);
     }
 }

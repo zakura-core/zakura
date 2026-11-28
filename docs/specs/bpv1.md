@@ -136,9 +136,10 @@ plus `META_GRACE_FLOOR`. `HeaderMeta` that arrives in the grace turns the
 reservation into the claim. Native block sync reserves each block at most once,
 and never reserves a block that it saw claimed, so BPv1 delays a body by at
 most one grace before its claim, and never after a release. A release for any
-reason but commitment marks the block, so a later request is never reserved.
-A mark keeps the highest height that the node saw for the block, because a
-peer's header-sync status names the height of its target.
+reason but the block's commitment to the chain marks the block, so a later
+request is never reserved. A mark keeps the highest height that the node saw
+for the block, capped at the window's top, because a peer's header-sync status
+names the height of its target.
 The node remembers at most 1,024 such blocks, and reserves nothing new at that
 cap. A block that the cap leaves unmarked still stops reservations at or below
 its height until the window moves above that height. A request that native block sync started before any claim or reservation

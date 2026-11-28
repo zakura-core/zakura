@@ -92,7 +92,7 @@ const MAX_SEEN: usize = 1024;
 struct Table {
     entries: HashMap<block::Hash, Entry>,
     /// Hashes seen reserved or claimed, or released for a reason other than
-    /// commitment, by height. They are never reserved again. A hash leaves
+    /// [`BodyClaimRelease::Committed`], by height. They are never reserved again. A hash leaves
     /// when BPv1's window moves above its height.
     seen: HashMap<block::Hash, u32>,
     /// The highest height of a hash that [`Self::see`] could not record at
@@ -119,7 +119,15 @@ impl Table {
     /// Records `hash` at `height` in [`Self::seen`], keeping the highest
     /// height seen for it: a header-sync target's height comes from the peer.
     /// At the cap, raises [`Self::unmarked_through`] to `height` instead.
+    ///
+    /// Records nothing while BPv1 publishes no window, and never above the
+    /// window's top, which no real header in the window exceeds, so a peer's
+    /// height cannot keep a mark past the window.
     fn see(&mut self, hash: block::Hash, height: u32) {
+        let Some(window) = self.window else {
+            return;
+        };
+        let height = height.min(window.high_inclusive);
         if let Some(marked) = self.seen.get_mut(&hash) {
             *marked = (*marked).max(height);
             return;
@@ -317,8 +325,8 @@ impl SharedBodyClaims {
             table.see(hash, height);
             return true;
         }
-        if let Some(marked) = table.seen.get_mut(&hash) {
-            *marked = (*marked).max(height);
+        if table.seen.contains_key(&hash) {
+            table.see(hash, height);
             return false;
         }
         if table.seen.len() >= MAX_SEEN
@@ -743,6 +751,14 @@ mod tests {
         assert!(
             !claims.defer_to_bpv1(hash, 101, expired),
             "the mark stays while the window holds the header's height"
+        );
+
+        // A peer's height above the window cannot pin the mark.
+        assert!(!claims.defer_to_bpv1(hash, u32::MAX, expired));
+        claims.set_bpv1_window(window(122, 154));
+        assert!(
+            !claims.lock().seen.contains_key(&hash),
+            "the mark leaves once the window passes its top"
         );
     }
 

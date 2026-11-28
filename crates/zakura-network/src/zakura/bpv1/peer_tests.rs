@@ -1825,7 +1825,10 @@ fn bpv1_14_part_behind_header_meta_under_admission_waits_then_is_accepted() {
     );
 
     let admit = admit_tiny(&mut peer, block_id, now);
-    assert!(!queues_meta(&admit), "bpv1-4 the metadata goes back");
+    assert!(
+        !queues_meta(&admit),
+        "bpv1-4: the metadata never goes back to its sender"
+    );
     assert_eq!(part_auth(&admit), Some(PartAuth::Seed));
     assert!(verify_token(&admit).is_some(), "admission replays the part");
     assert_eq!(peer.early_data_bytes(), 0);
@@ -1866,6 +1869,21 @@ fn bpv1_14_part_for_dropped_header_meta_drops() {
     let s = peer.step(now, tiny_part_prefix(block_id, 0));
     assert!(peer.close_cause().is_none());
     assert_eq!(drop_reason(&s, 0), Some(DropReason::MetaDropped));
+    peer.assert_invariants();
+
+    // The session never heard of the block before it was evicted, but the
+    // peer's metadata crossed and waited.
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(now, recv_meta(block_id));
+    peer.step(now, PeerInput::EvictRetired { block_id });
+    let s = peer.step(now, tiny_part_prefix(block_id, 0));
+    assert!(
+        peer.close_cause().is_none(),
+        "the crossed metadata keeps it open"
+    );
+    assert_eq!(drop_reason(&s, 0), Some(DropReason::MetaDropped));
+    peer.step(now, have_with(block_id, HaveFlags::Plain, vec![2]));
+    assert!(peer.close_cause().is_none());
     peer.assert_invariants();
 }
 

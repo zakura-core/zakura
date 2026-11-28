@@ -1841,8 +1841,8 @@ impl DataWriter {
     }
 
     /// Queues a `HeaderMeta` ahead of every queued item but earlier
-    /// `HeaderMeta`s and starts writing if idle. It waits behind at most the
-    /// one frame in flight (bpv1-8).
+    /// `HeaderMeta`s and starts writing if idle (bpv1-8). It still waits
+    /// behind the frames already handed to the transport.
     pub(super) fn push_header_meta(&mut self, message: Box<Bpv1Message>) {
         self.queue.push_header_meta(message);
         self.start();

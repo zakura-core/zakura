@@ -150,7 +150,7 @@ const RAW_STREAM_WINDOW: u32 = 4 * 65_536;
 /// cov-3 (`bpv1-54`, `bpv1-55`, acceptance criterion 4, level-8): over real
 /// QUIC, a peer stops reading BPv1 data while a proposer serves it a 2 MB
 /// `Want`, far beyond its stream window. The proposer still reads the peer's
-/// next `Want` on control. Once the peer reads data again, each block's
+/// next `Want` on control, and its `BlockDone` reaches the peer. Once the peer reads data again, each block's
 /// `HeaderMeta` arrives ahead of its traffic (bpv1-8), and each `WantEnd`
 /// arrives behind exactly the parts it ends.
 #[tokio::test]
@@ -229,6 +229,21 @@ async fn bpv1_54_55_control_progresses_and_ends_follow_parts_while_data_is_pause
     assert!(handle_v.publish_solved_block(&small, height.0));
     let small_k = 1;
     send_want(&mut raw, 2, small.hash(), 0..small_k).await?;
+    // Control still reaches the peer: the proposer's `BlockDone` for the
+    // small block arrives while the peer reads no data (bpv1-9).
+    tokio::time::timeout(TEST_NET_TIMEOUT, async {
+        loop {
+            if let Bpv1Message::BlockDone { block_id, .. } =
+                decode_frame::<Bpv1Message>(&raw.recv(CONTROL).await?)?
+            {
+                if block_id == small.hash() {
+                    return Ok::<_, BoxError>(());
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| "bpv1-54: no control frame reached the paused peer")??;
 
     // bpv1-55: reading data again, each end follows exactly its parts. The
     // proposer flags the raw peer's seeds in `Have`s ahead of them

@@ -846,7 +846,7 @@ const _: () = assert!(
     HEADER_META_RULE.payload.max()
         + 64 * (PART_RULE.payload.max() + FRAME_HEADER_BYTES)
         + FRAME_HEADER_BYTES
-        <= 8 * 1024 * 1024
+        <= BPV1_DATA_BUDGET.receive as usize
 );
 
 /// BPv1's two persistent ordered streams, admitted together as one session.
@@ -1370,5 +1370,18 @@ impl Bpv1FifoQueue {
             | DataQueueItem::Have { .. }
             | DataQueueItem::WantEnd { .. } => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_cap_registry_tests {
+    /// Section 8's registry row states these caps.
+    #[test]
+    fn frame_caps_match_the_registry() {
+        assert_eq!(
+            (super::CONTROL_FRAME_CAP, super::DATA_FRAME_CAP),
+            (59, 2_006_286),
+            "update the section 8 registry row with the caps"
+        );
     }
 }

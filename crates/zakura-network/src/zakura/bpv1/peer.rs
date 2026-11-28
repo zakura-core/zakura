@@ -1334,6 +1334,8 @@ impl PeerState {
                     self.note_meta_dropped(block_id);
                 }
                 if self.meta_received_pending.remove(&block_id) {
+                    // The peer's metadata crossed, so its later data drops.
+                    self.note_meta_dropped(block_id);
                     self.drop_early_for_block(block_id, &mut step);
                 }
                 self.flags_lost.retain(|b| *b != block_id);

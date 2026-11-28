@@ -703,8 +703,9 @@ by the ordering it needs:
   on the data stream ahead of every queued message except earlier
   `HeaderMeta`s. It queues no `Part` or `Have` for the block to the peer
   before it queued or received the metadata. So a receiver reads a peer's
-  `HeaderMeta` before that peer's parts and `Have`s for the block, and a
-  `HeaderMeta` waits behind at most the frame in flight.
+  `HeaderMeta` before that peer's parts and `Have`s for the block. A
+  `HeaderMeta` still waits behind the frames that the writer already handed to
+  the transport.
 - **Ends travel behind parts.** `WantEnd` follows, on the FIFO data stream,
   every part its `Want` exchange authorized. No part of an ended `Want` can
   follow its `WantEnd`. The receiver closes the reservation exactly when it
@@ -1440,7 +1441,7 @@ fields, trailing bytes, and lengths above these bounds before allocation.
 | Pushed seeds per stripe per holder; flagged indices per stripe per connection | `min(n - k, ceil(real / eligible))`; `n` from `proposer_node`, of which `n - k` relay, and `n - k` from any other peer |
 | Header bytes; key-binding bytes | 4,096; 2,002,086 |
 | Coinbase bytes; coinbase Merkle siblings | `MAX_BLOCK_BYTES` (the consensus bound); 32 |
-| Control-stream frame cap; data-stream frame cap | 2,006,286 bytes; 66,085 bytes |
+| Control-stream frame cap; data-stream frame cap | 59 bytes; 2,006,286 bytes |
 
 These are syntax limits, not assembly reservations or performance guarantees.
 The profile MUST impose lower admission bounds where consensus or node-wide work

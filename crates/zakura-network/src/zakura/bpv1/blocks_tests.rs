@@ -3614,7 +3614,15 @@ fn bpv1_57_metadata_for_the_committed_tip_is_retired_at_admission() {
             | BlockOutput::ClosePeer { .. }
     )));
     let again = receive(&mut table, t0, envelope);
-    assert!(again.outputs.is_empty(), "a later copy starts no admission");
+    assert!(
+        matches!(
+            again.outputs.as_slice(),
+            [BlockOutput::MetaRejected { block_id: id, .. }] if *id == block_id
+        ),
+        "a later copy starts no admission, and its session drops the \
+         peer's later data for the block: {:?}",
+        again.outputs
+    );
     table.assert_invariants();
 }
 
@@ -4915,7 +4923,14 @@ fn bpv1_83_siblings_of_the_next_block_evict_each_block_above_it_once() {
             session_gen: 1,
         },
     );
-    assert!(again.outputs.is_empty() && again.events.is_empty());
+    assert!(
+        matches!(
+            again.outputs.as_slice(),
+            [BlockOutput::MetaRejected { block_id, .. }] if *block_id == above[3]
+        ) && again.events.is_empty(),
+        "only the copy's rejection: {:?}",
+        again.outputs
+    );
     assert_eq!(table.block_phase(&above[3]), Some(BlockPhase::Retired));
     table.assert_invariants();
 }

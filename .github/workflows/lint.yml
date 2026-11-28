@@ -260,6 +260,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_ci_alert.py
 
+      - name: Link rot tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/workflows/scripts/test_link_rot.py
+
       - name: Read-only release review tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'

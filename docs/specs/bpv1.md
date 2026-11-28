@@ -135,7 +135,8 @@ and never reserves a block that it saw claimed, so BPv1 delays a body by at
 most one grace before its claim, and never after a release. A release for any
 reason but commitment marks the block, so a later request is never reserved.
 The node remembers at most 1,024 such blocks, and reserves nothing new at that
-cap. A request that native block sync started before any claim or reservation
+cap. A block that the cap leaves unmarked still stops reservations at or below
+its height until the window moves above that height. A request that native block sync started before any claim or reservation
 runs to completion. Removing an expired claim or reservation wakes every holder
 whose timer waited on it.
 

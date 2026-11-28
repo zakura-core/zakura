@@ -80,7 +80,8 @@ struct Entry {
 /// The most hashes that [`Table::seen`] holds. BPv1's window spans
 /// `2 × PROPAGATION_DEPTH` heights, so honest forks stay far below it. A
 /// peer's statuses can name hashes that never become blocks. At the cap
-/// nothing new is reserved, and both syncs fetch at once.
+/// nothing new is reserved, and both syncs fetch at once. A mark that the cap
+/// refuses still stops reservations, through [`Table::unmarked_through`].
 const MAX_SEEN: usize = 1024;
 
 #[derive(Debug, Default)]
@@ -90,6 +91,10 @@ struct Table {
     /// commitment, by height. They are never reserved again. A hash leaves
     /// when BPv1's window moves above its height.
     seen: HashMap<block::Hash, u32>,
+    /// The highest height of a hash that [`Self::see`] could not record at
+    /// the cap. Nothing at or below it is reserved until BPv1's window moves
+    /// above it, so a skipped mark never lets a hash be reserved again.
+    unmarked_through: Option<u32>,
     window: Option<Bpv1Window>,
     /// The node ids of the peers with a live BPv1 session. Only they send
     /// this node `HeaderMeta`.
@@ -103,10 +108,16 @@ impl Table {
         before - self.entries.len()
     }
 
-    /// Records `hash` at `height` in [`Self::seen`] below the cap.
+    /// Records `hash` at `height` in [`Self::seen`]. At the cap, raises
+    /// [`Self::unmarked_through`] to `height` instead.
     fn see(&mut self, hash: block::Hash, height: u32) {
+        if self.seen.contains_key(&hash) {
+            return;
+        }
         if self.seen.len() < MAX_SEEN {
-            self.seen.entry(hash).or_insert(height);
+            self.seen.insert(hash, height);
+        } else {
+            self.unmarked_through = self.unmarked_through.max(Some(height));
         }
     }
 
@@ -242,6 +253,12 @@ impl SharedBodyClaims {
             table
                 .seen
                 .retain(|_, height| *height > window.low_exclusive);
+            if table
+                .unmarked_through
+                .is_some_and(|height| height <= window.low_exclusive)
+            {
+                table.unmarked_through = None;
+            }
         }
         table.window = window;
     }
@@ -284,6 +301,9 @@ impl SharedBodyClaims {
         }
         if table.seen.contains_key(&hash)
             || table.seen.len() >= MAX_SEEN
+            || table
+                .unmarked_through
+                .is_some_and(|through| height <= through)
             || table.bpv1_peers.is_empty()
         {
             return false;
@@ -658,5 +678,38 @@ mod tests {
             "at the cap, both syncs fetch at once"
         );
         assert_eq!(claims.lock().seen.len(), MAX_SEEN);
+    }
+
+    #[test]
+    fn a_release_at_the_cap_is_never_reserved_after_the_window_moves() {
+        let claims = SharedBodyClaims::new();
+        let t0 = Instant::now();
+        let released = block::Hash([0xAA; 32]);
+        claims.set_bpv1_window(window(84, 116));
+        claims.set_bpv1_peer([7; 32], true);
+        assert!(claims.claim_at(released, t0 + Duration::from_secs(15), t0));
+        for index in 0..MAX_SEEN {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+            assert!(claims.defer_to_bpv1(block::Hash(bytes), 85, t0));
+        }
+
+        // The full set refuses the release's mark.
+        assert!(claims.release(released, BodyClaimRelease::Fallback));
+        assert!(!claims.lock().seen.contains_key(&released));
+
+        // The window drops the filler marks but still holds the block.
+        claims.set_bpv1_window(window(85, 117));
+        assert!(claims.lock().seen.is_empty());
+        assert!(
+            !claims.defer_to_bpv1(released, 101, t0),
+            "a release the cap could not mark is never reserved afterwards"
+        );
+
+        claims.set_bpv1_window(window(117, 141));
+        assert!(
+            claims.defer_to_bpv1(block::Hash([0xBB; 32]), 130, t0),
+            "reservations resume once the window passes the skipped mark"
+        );
     }
 }

@@ -4216,8 +4216,9 @@ fn discovery_ordinary_cap(max_connections: usize, connection_headroom: usize) ->
 /// target, reachable nodes fill each other's slots up to the soft cap and
 /// leave only the few above it for nodes whose records carry no address,
 /// which can only dial.
-/// The target stays above the headroom, so discovery keeps a dial with every
-/// bootstrap peer connected (see `min_budgeted_connections`).
+/// The target stays above the headroom, so at the connection budget floor a
+/// node that holds only its bootstrap peers, such as a seed holding every
+/// other seed, still has a discovery dial left (see `min_budgeted_connections`).
 fn discovery_outbound_target(max_connections: usize, connection_headroom: usize) -> usize {
     let soft_cap = discovery_ordinary_cap(max_connections, connection_headroom);
     let outbound_reserve =
@@ -11254,7 +11255,8 @@ mod tests {
     }
 
     /// Discovery dials up to the outbound reserve, and at the connection
-    /// budget floor it keeps a dial with every bootstrap peer connected.
+    /// budget floor a node that holds only its bootstrap peers still has a
+    /// dial left.
     #[test]
     fn the_outbound_target_is_the_reserve_above_the_bootstrap_headroom() {
         use crate::zakura::{

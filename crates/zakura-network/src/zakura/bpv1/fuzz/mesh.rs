@@ -51,7 +51,7 @@
 //! the adversary and the delivery order rather than from the driver.
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -63,7 +63,7 @@ use zakura_chain::{
     transaction::Transaction,
 };
 use zakura_quic::NodeId;
-use zakura_rt::time::Instant;
+use zakura_rt::{collections::HashSet, time::Instant};
 
 use super::{
     chain::{block_of, build_v6_tx, committed_coinbase, regtest_nu7},

@@ -1,0 +1,68 @@
+---
+source: crates/zakura-rpc/src/methods/types/transaction/v7_tests.rs
+expression: json
+---
+{
+  "in_active_chain": true,
+  "hex": "[elided]",
+  "height": 1000,
+  "confirmations": 1,
+  "vin": [],
+  "vout": [],
+  "vShieldedSpend": [],
+  "vShieldedOutput": [],
+  "vjoinsplit": [],
+  "orchard": {
+    "actions": [],
+    "valueBalance": 0.0,
+    "valueBalanceZat": 0
+  },
+  "ironwood": {
+    "actions": [
+      {
+        "cv": "0000000000000000000000000000000000000000000000000000000000000000",
+        "nullifier": "577c063e93013ea396b30ce8b94d6459a3b4811e12283b01f9a5af73c4bd0d30",
+        "rk": "d8f84cfb6c9a20d7b47c45ac4ec3f3a554d92d36981d127a94b3d2bc1167ca9c",
+        "cmx": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ephemeralKey": "00000000ed302d991bf94c09fc98462200000000000000000000000000000040",
+        "encCiphertext": "4817ac2e2da58483cc8ce1a5fa27c38e49ad5467c2f62cf6397cd112dc50884731239f0721a9141117dba3bf991a5eaf2dd67a1bfa4025347945d3976865e01ec26594a5e042c4331a2dadfeb4b86b0f0600d1a59ace539ecb08f99dafda5902d7d46bcb77ecff8c893e956b8c1bf87387959e07494e00fb4eefb8cf64f5ec60fa8cac169377632bb9a037aaec9ab18cdd43efac998a7d1a367153ecc497a8ae99071229af5f883b9055c3f2d0c1c15d065c1cb8cdf091b22f4790e1a88d840dd416bac2f9f6f21b0f38c4ac92402ff324edf2af0678e9d68879c48713ef270a2c14cca1e2887d73a54b32671c2708971cf076d40326aac136fce468975e1ab7929d79f1181774df14e946e5b18bb1f10f3a0ef2af70e7fe0a4dfe43e2373993ef048b78bd54d04a79b2344ed396c94afd70ea7b238fe76307aa22dda8c8391c3bcdce8a71e8552bc99c6b91a8eb9768a721d977b8b4673c74d4231cee2422fca50cdec3285c7dfad1983a2d4cc844004c702af198ff078e3fbe4806b519cb818a3600efe851206ea1734dd4ac16410b4a2d581f1f10299989d0a73bf6665aa46e3242c19ef02cee8612c5e189318f619295594011c1fb59e71cb5b47c77309dfcd3e0e71ffce5aff428513ea03d216c5feb984c10fe993aeee61c39c34363387896d4e9d888215276d55b6ed3089b0eb2a641c30fabd04488fb4743febc3dfd95de69faea7aa5b41e39bc23872888e399a3d37af9878646ab461e3ba804e8646451e7c9fee91c79b6d2ee44cdbbe466b469d331be14c601972528dfa81950e460486622",
+        "spendAuthSig": "07070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707",
+        "outCiphertext": "00bb849c354aebf118b7e7675ad8e5592dd144edb23b520b53d4c874d5bb61d8f0bfc357bff99bdbf4f4e5cd576c53ce5ccb9d5c0e6a5ed6f8860e0e27660a2b712e0254b1b86ee1dc2d20e98ee41c08"
+      }
+    ],
+    "valueBalance": 0.00015,
+    "valueBalanceZat": 15000,
+    "flags": {
+      "enableOutputs": true,
+      "enableSpends": true,
+      "enableCrossAddress": false
+    },
+    "anchor": "0000000000000000000000000000000000000000000000000000000000000000",
+    "proof": "[elided]",
+    "bindingSig": "09090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909"
+  },
+  "valuePoolDeltas": [
+    {
+      "bundleType": 4,
+      "bundleVariant": 0,
+      "value": 0.00015,
+      "valueZat": 15000
+    },
+    {
+      "bundleType": 5,
+      "bundleVariant": 0,
+      "value": -0.00015,
+      "valueZat": -15000
+    }
+  ],
+  "valueBalance": 0.0,
+  "valueBalanceZat": 0,
+  "size": 6034,
+  "txid": "6fa6335ebc8c1ff08658cdd616c0a667abf975a98b04ddaf81f723954220cf26",
+  "authdigest": "2e427a0e3895620e8df41a7bda5ac216cec146c818cb903539e7125082cf187a",
+  "overwintered": true,
+  "version": 7,
+  "versiongroupid": "fffffff7",
+  "locktime": 0,
+  "expiryheight": 1000
+}

@@ -12,7 +12,7 @@ use zakura_chain::{
     parameters::{
         subsidy::{
             founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
-            FundingStreamReceiver, ParameterSubsidy, SubsidyError,
+            take_lockbox_deposit, ParameterSubsidy, SubsidyError, V7CoinbaseIssuance,
         },
         Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
         SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
@@ -363,14 +363,11 @@ pub fn subsidy_is_valid(
         // [ZIP-48]: <https://zips.z.cash/zip-0048>
         // [Bitcoin-P2SH]: <https://developer.bitcoin.org/devguide/transactions.html#pay-to-script-hash-p2sh>
 
+        // The deferred pool contribution has no output: it is checked in
+        // `miner_fees_are_valid()` according to [ZIP-1015](https://zips.z.cash/zip-1015).
         let mut funding_streams = funding_stream_values(height, net, expected_block_subsidy)?;
-
-        // The deferred pool contribution is checked in `miner_fees_are_valid()` according to
-        // [ZIP-1015](https://zips.z.cash/zip-1015).
         let mut lockbox = LockboxFlows {
-            deposit: funding_streams
-                .remove(&FundingStreamReceiver::Deferred)
-                .unwrap_or_default(),
+            deposit: take_lockbox_deposit(&mut funding_streams),
             disbursement: Amount::zero(),
         };
 
@@ -558,33 +555,26 @@ fn v7_coinbase_is_valid(
     if coinbase.height() != height {
         Err(SubsidyError::V7CoinbaseHeightMismatch)?;
     }
-    if coinbase.block_subsidy() != expected_block_subsidy {
+    let issuance = V7CoinbaseIssuance::with_lockbox_deposit(
+        height,
+        network,
+        expected_block_subsidy,
+        lockbox_deposit,
+        block_transaction_fees,
+    )?;
+    if coinbase.block_subsidy() != issuance.block_subsidy {
         Err(SubsidyError::V7CoinbaseSubsidyMismatch)?;
     }
-    if coinbase.lockbox_value() != lockbox_deposit {
+    if coinbase.lockbox_value() != issuance.lockbox_value {
         Err(SubsidyError::V7CoinbaseLockboxMismatch)?;
     }
-
-    // ZIP 235: the part of the fees that the miner does not receive. It can exceed the
-    // subsidy less the deposit, and then the coinbase delta is negative:
+    // ZIP 235 can make the coinbase delta negative:
     //
     // > Note that the coinbase value pool delta can be negative.
-    let signed = |amount: Amount<NonNegative>| -> Amount<NegativeAllowed> {
-        amount
-            .constrain()
-            .expect("a nonnegative amount is a valid signed amount")
-    };
-    let nsm_fee_contribution = signed(block_transaction_fees)
-        - signed(miner_fee_share(height, network, block_transaction_fees));
-    let expected_coinbase_delta = nsm_fee_contribution
-        .and_then(|contribution| {
-            signed(expected_block_subsidy) - signed(lockbox_deposit) - contribution
-        })
-        .map_err(|_| SubsidyError::Underflow)?;
-    if deltas.coinbase != expected_coinbase_delta {
+    if deltas.coinbase != issuance.coinbase_delta()? {
         Err(SubsidyError::V7CoinbaseDeltaMismatch)?;
     }
-    if deltas.fee != signed(block_transaction_fees) {
+    if deltas.fee != issuance.fees.constrain::<NegativeAllowed>()? {
         Err(SubsidyError::V7CoinbaseFeesMismatch)?;
     }
 

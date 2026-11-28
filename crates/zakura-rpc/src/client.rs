@@ -36,8 +36,9 @@ pub use crate::methods::{
         },
         subsidy::{FundingStream, GetBlockSubsidyResponse},
         transaction::{
-            Input, JoinSplit, Orchard, OrchardAction, OrchardFlags, Output, ScriptPubKey,
-            ScriptSig, ShieldedOutput, ShieldedSpend, TransactionObject, TransactionTemplate,
+            CoinbaseBundleObject, Input, JoinSplit, MinerPoll, MinerSignal, Orchard, OrchardAction,
+            OrchardFlags, Output, ScriptPubKey, ScriptSig, ShieldedOutput, ShieldedSpend,
+            TransactionObject, TransactionTemplate, ValuePoolDelta,
         },
         unified_address::ZListUnifiedReceiversResponse,
         validate_address::ValidateAddressResponse,

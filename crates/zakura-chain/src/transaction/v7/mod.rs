@@ -30,6 +30,7 @@ pub(crate) use codec::{read, V7_VERSION_GROUP_ID};
 pub(crate) use sighash::V7SighashCache;
 
 use crate::{
+    amount::{Amount, NegativeAllowed},
     block, orchard,
     parameters::NetworkUpgrade,
     sapling,
@@ -99,6 +100,20 @@ impl<'a> V7Ref<'a> {
     /// Returns the authorizing data commitment.
     pub(crate) fn authorizing_digest(&self) -> AuthDigest {
         AuthDigest(self.auth_digest())
+    }
+
+    /// Returns `mValuePoolDeltas` in encoding order, which omits zero deltas.
+    pub(crate) fn value_pool_deltas(&self) -> Vec<(BundleKind, Amount<NegativeAllowed>)> {
+        self.pool_deltas()
+            .nonzero()
+            .into_iter()
+            .map(|(id, delta)| {
+                (
+                    BundleKind::of(id).expect("every delta field belongs to a registered bundle"),
+                    delta,
+                )
+            })
+            .collect()
     }
 
     /// Returns the bundles that have an entry in any of the transaction's maps, in bundle

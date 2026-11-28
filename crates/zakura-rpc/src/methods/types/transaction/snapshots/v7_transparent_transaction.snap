@@ -1,0 +1,65 @@
+---
+source: crates/zakura-rpc/src/methods/types/transaction/v7_tests.rs
+expression: json
+---
+{
+  "in_active_chain": true,
+  "hex": "07000080f7fffffffeffffff00000000e803000002000010270000000000000500f0d8ffffffffffff0100003401010101010101010101010101010101010101010101010101010101010101010100000000ffffffff01905f01000000000001510100000401000151",
+  "height": 1000,
+  "confirmations": 1,
+  "vin": [
+    {
+      "txid": "0101010101010101010101010101010101010101010101010101010101010101",
+      "vout": 0,
+      "scriptSig": {
+        "asm": "1",
+        "hex": "51"
+      },
+      "sequence": 4294967295
+    }
+  ],
+  "vout": [
+    {
+      "value": 0.0009,
+      "valueZat": 90000,
+      "n": 0,
+      "scriptPubKey": {
+        "asm": "1",
+        "hex": "51",
+        "type": "nonstandard"
+      }
+    }
+  ],
+  "vShieldedSpend": [],
+  "vShieldedOutput": [],
+  "vjoinsplit": [],
+  "orchard": {
+    "actions": [],
+    "valueBalance": 0.0,
+    "valueBalanceZat": 0
+  },
+  "valuePoolDeltas": [
+    {
+      "bundleType": 0,
+      "bundleVariant": 0,
+      "value": 0.0001,
+      "valueZat": 10000
+    },
+    {
+      "bundleType": 5,
+      "bundleVariant": 0,
+      "value": -0.0001,
+      "valueZat": -10000
+    }
+  ],
+  "valueBalance": 0.0,
+  "valueBalanceZat": 0,
+  "size": 105,
+  "txid": "755b4b33136f295fe74e1cb62eff9da69e82c03c2ac028422c9857220e8b30d4",
+  "authdigest": "d86f9a8a476fba9039d908373554f62d71b24bd6fa160c7c7e4ed263511bffd9",
+  "overwintered": true,
+  "version": 7,
+  "versiongroupid": "fffffff7",
+  "locktime": 0,
+  "expiryheight": 1000
+}

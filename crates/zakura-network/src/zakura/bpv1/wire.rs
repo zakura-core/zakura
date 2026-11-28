@@ -25,8 +25,8 @@ use crate::zakura::{
         encode_frame, BlockHash, BoundedReader, LeU16, LeU32, List, Wire, WireError, WireMessage,
         U8,
     },
-    Cadence, Frame, MessageRole, MessageRule, PayloadLen, ReactorBudget, Stream, StreamQueueDepths,
-    FRAME_HEADER_BYTES,
+    Cadence, Frame, MessageRole, MessageRule, PayloadLen, ReactorBudget, ReceiveBudget, Stream,
+    StreamQueueDepths, FRAME_HEADER_BYTES,
 };
 
 /// Capability bit for BPv1 block propagation.
@@ -812,15 +812,16 @@ pub const DATA_FRAME_CAP: u32 = (PART_RULE.payload.max() + FRAME_HEADER_BYTES) a
 /// `HeaderMeta` frame, whose coinbase may reach `MAX_BLOCK_BYTES`
 /// (decision-23), plus 512 KiB for the small control messages beside it.
 pub const BPV1_CONTROL_BUDGET: ReactorBudget = ReactorBudget {
-    // Widening `u32` to `u64` is lossless.
-    receive: CONTROL_FRAME_CAP as u64 + 512 * 1024,
+    // Widening `u32` to `u64` is lossless. Peers announce unasked.
+    receive: ReceiveBudget::unsolicited_only(CONTROL_FRAME_CAP as u64 + 512 * 1024),
     output: CONTROL_FRAME_CAP as u64 + 512 * 1024,
 }
 .assert_frame_cap(CONTROL_FRAME_CAP);
 
 /// Per-connection budget for the BPv1 data stream (covers `PULL_WINDOW = 64` parts).
 pub const BPV1_DATA_BUDGET: ReactorBudget = ReactorBudget {
-    receive: 8 * 1024 * 1024,
+    // Holders and proposers may push parts unasked.
+    receive: ReceiveBudget::unsolicited_only(8 * 1024 * 1024),
     output: 8 * 1024 * 1024,
 }
 .assert_frame_cap(DATA_FRAME_CAP);

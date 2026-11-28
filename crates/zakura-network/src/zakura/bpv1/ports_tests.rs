@@ -197,6 +197,7 @@ async fn native_block_sync_skips_bpv1_claimed_hash_and_fetches_on_fallback_relea
         tip_rx,
         pool,
         ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
     )
     .with_body_claims(claims.clone());
     startup.committed_views = Some(crate::zakura::testkit::startup_committed_view(
@@ -305,6 +306,7 @@ async fn native_block_sync_fetches_a_bpv1_claimed_hash_once_the_claim_expires() 
         tip_rx,
         pool,
         ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
     )
     .with_body_claims(claims.clone());
     startup.committed_views = Some(crate::zakura::testkit::startup_committed_view(

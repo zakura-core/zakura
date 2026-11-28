@@ -60,6 +60,17 @@ impl BlockTable {
             self.config.part_buffer_bytes
         );
 
+        // The `Propagation` lease the IO shell holds covers every retained
+        // byte, and the reserve sized from `retained_bound` covers the lease.
+        assert!(
+            self.retained_bytes() <= self.lease_bytes()
+                && self.lease_bytes() <= Self::retained_bound(&self.config),
+            "{BLOCK_REPLAY}: retained bytes {} > lease {} or lease > bound {}",
+            self.retained_bytes(),
+            self.lease_bytes(),
+            Self::retained_bound(&self.config)
+        );
+
         // bpv1-50: every indexed header, unknown-parent, or commitment job
         // belongs to its admitting or pending entry, so finished or abandoned
         // work leaves no lease.
@@ -86,6 +97,20 @@ impl BlockTable {
             "{BLOCK_REPLAY}: concurrent non-retired blocks {} > cap {}",
             non_retired,
             self.config.max_concurrent_blocks
+        );
+
+        // mem-5: the reserve funds every assembled block until its verdict.
+        let verdicts = self
+            .blocks
+            .values()
+            .filter(|b| b.verify_work_id.is_some())
+            .count()
+            .saturating_add(self.owed_verdicts.len());
+        assert!(
+            verdicts <= Self::max_owed_verdicts(&self.config),
+            "{BLOCK_REPLAY}: owed verdicts {} > bound {}",
+            verdicts,
+            Self::max_owed_verdicts(&self.config)
         );
 
         for block in self.blocks.values() {

@@ -98,6 +98,7 @@ pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 10;
 // Bits 6 and 7 are reserved for spentness hints and wallet transaction submission.
 // Bit `1 << 8` identifies block sync (stream version 3) in `block_sync::wire`.
 // Bit `1 << 2` identified the retired discovery stream version 1. Do not reuse it.
+// Bit `1 << 12` identified the retired BPv1 stream version 1. Do not reuse it.
 
 /// Production default for per-service peer caps.
 pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;

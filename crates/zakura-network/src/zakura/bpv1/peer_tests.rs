@@ -29,7 +29,7 @@ use super::{
 /// Whether `step` queues a `HeaderMeta` to the peer.
 fn queues_meta(step: &PeerStep) -> bool {
     step.outputs.iter().any(|o| {
-        matches!(o, PeerOutput::SendControl(msg) if matches!(**msg, Bpv1Message::HeaderMeta { .. }))
+        matches!(o, PeerOutput::SendHeaderMeta(msg) if matches!(**msg, Bpv1Message::HeaderMeta { .. }))
     })
 }
 
@@ -345,8 +345,17 @@ fn scenario_early_record_full_pauses_data_only_and_replays_on_admission() {
     let mut peer = PeerState::new(config, node_id(2), 1);
     let t0 = Instant::now();
 
-    // Proposer's HeaderMeta delayed on control so its flagged `Have` and
-    // seed parts 0 and 1 arrive first.
+    // The proposer's `HeaderMeta` leads its flagged `Have` and seed parts 0
+    // and 1 on the data stream. Local admission is still running when they
+    // arrive, so they wait (bpv1-14).
+    let meta_rx = peer.step(
+        t0,
+        PeerInput::RecvHeaderMeta {
+            block_id,
+            message: proposer_meta(block_id, node_id(2)),
+        },
+    );
+    assert!(meta_rx.events.contains(&PeerEvent::MetaReceived(block_id)));
     peer.step(t0, flag);
     let s1 = peer.step(t0, tiny_part_prefix(block_id, 0));
     assert!(!peer.is_data_paused());
@@ -358,16 +367,6 @@ fn scenario_early_record_full_pauses_data_only_and_replays_on_admission() {
     let s2 = peer.step(t0, tiny_part_prefix(block_id, 1));
     assert!(peer.is_data_paused());
     assert!(s2.outputs.contains(&PeerOutput::PauseDataReads));
-
-    // The control stream still works while data reads are paused (bpv1-54).
-    let meta_rx = peer.step(
-        t0,
-        PeerInput::RecvHeaderMeta {
-            block_id,
-            message: proposer_meta(block_id, node_id(2)),
-        },
-    );
-    assert!(meta_rx.events.contains(&PeerEvent::MetaReceived(block_id)));
 
     // Admission replays the held seed parts and resumes data reads.
     let admit = peer.step(
@@ -860,6 +859,15 @@ fn scenario_close_cites_the_stream_it_read() {
     let cause = control.close_cause().expect("a repeated BlockDone closes");
     assert_eq!(cause.row, Bpv1CloseRow::Row11DuplicateBlockDone);
     assert_eq!(cause.stream_kind, BPV1_CONTROL_KIND);
+
+    // A repeated `HeaderMeta` arrives on the data stream (bpv1-8).
+    let mut meta = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    for _ in 0..2 {
+        meta.step(now, recv_meta(block_id));
+    }
+    let cause = meta.close_cause().expect("a repeated HeaderMeta closes");
+    assert_eq!(cause.row, Bpv1CloseRow::Row5DuplicateHeaderMeta);
+    assert_eq!(cause.stream_kind, BPV1_DATA_KIND);
 }
 
 /// `PULL_WINDOW` bounds the parts outstanding from
@@ -912,11 +920,13 @@ fn scenario_early_record_refusals_emit_part_dropped() {
 
     // A frame larger than the whole cap can never fit.
     let mut peer = PeerState::new(config, node_id(2), 1);
+    peer.step(now, recv_meta(block_id));
     let oversize = peer.step(now, prefix(0, 65));
     assert_eq!(dropped(&oversize, 0), Some(DropReason::EarlyOversize));
 
     // A frame that does not fit beside held entries is dropped as full.
     let mut peer = PeerState::new(config, node_id(2), 1);
+    peer.step(now, recv_meta(block_id));
     peer.step(now, prefix(0, 40));
     let full = peer.step(now, prefix(1, 40));
     assert!(peer.is_data_paused());
@@ -1519,8 +1529,8 @@ fn decision24_flagged_have_is_chunked_at_the_have_limit() {
     peer.assert_invariants();
 }
 
-/// decision-24: a flagged `Have` for an unadmitted block waits in the early
-/// record and counts toward the bound at replay.
+/// decision-24: a flagged `Have` behind metadata under admission waits in
+/// the early record and counts toward the bound at replay.
 #[test]
 fn decision24_flagged_have_for_unadmitted_block_waits_and_counts_at_replay() {
     let coding = tiny();
@@ -1528,6 +1538,7 @@ fn decision24_flagged_have_for_unadmitted_block_waits_and_counts_at_replay() {
     let now = Instant::now();
     let bound = coding.n - coding.k;
     let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
+    peer.step(now, recv_meta(block_id));
     let s = peer.step(now, have_with(block_id, HaveFlags::Push, vec![0]));
     assert!(s
         .events
@@ -1541,6 +1552,7 @@ fn decision24_flagged_have_for_unadmitted_block_waits_and_counts_at_replay() {
     }));
 
     let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
+    peer.step(now, recv_meta(block_id));
     peer.step(
         now,
         have_with(block_id, HaveFlags::Push, (0..bound).collect()),
@@ -1590,6 +1602,7 @@ fn bpv1_60_flagged_have_refused_by_a_full_early_record_never_closes() {
     let now = Instant::now();
     let block_id = block::Hash([0x67; 32]);
 
+    peer.step(now, recv_meta(block_id));
     peer.step(now, have_with(block_id, HaveFlags::Push, vec![0]));
     peer.step(now, tiny_part_prefix(block_id, 0));
     assert!(!peer.is_data_paused());
@@ -1636,6 +1649,7 @@ fn bpv1_48_early_record_charges_a_have_its_decoded_indices() {
     for i in 0..=cap / frame_bytes {
         let mut id = [0x6A; 32];
         id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        peer.step(now, recv_meta(block::Hash(id)));
         let step = peer.step(
             now,
             PeerInput::RecvHave(RecvHave {
@@ -1672,6 +1686,7 @@ fn bpv1_48_early_record_charges_a_have_its_decoded_indices() {
 #[test]
 fn bpv1_48_early_record_charges_a_have_its_block_id() {
     let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
+    peer.step(Instant::now(), recv_meta(block::Hash([0x6B; 32])));
     let step = peer.step(
         Instant::now(),
         PeerInput::RecvHave(RecvHave {
@@ -1704,10 +1719,10 @@ fn bpv1_60_flagged_have_lost_to_age_or_rejected_meta_never_closes() {
     for rejected in [false, true] {
         let block_id = block::Hash([0x68; 32]);
         let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
+        peer.step(t0, recv_meta(block_id));
         peer.step(t0, have_with(block_id, HaveFlags::Push, vec![0]));
         let mut now = t0;
         if rejected {
-            peer.step(now, recv_meta(block_id));
             peer.step(now, PeerInput::MetaRejected { block_id });
         } else {
             now = t0 + DEFAULT_EARLY_AGE;
@@ -1735,6 +1750,248 @@ fn bpv1_60_flagged_have_lost_to_age_or_rejected_meta_never_closes() {
         peer.step(now, PeerInput::SessionEnd);
         peer.assert_drained();
     }
+}
+
+/// The `PartDropped` reason `step` emits for part `index`, if any.
+fn drop_reason(step: &PeerStep, index: u32) -> Option<DropReason> {
+    step.events.iter().find_map(|e| match e {
+        PeerEvent::PartDropped {
+            index: i, reason, ..
+        } if *i == index => Some(*reason),
+        _ => None,
+    })
+}
+
+/// bpv1-14 (a): a `Part` for a block whose `HeaderMeta` crossed the
+/// connection in neither direction closes 21. The peer's `HeaderMeta` would
+/// have preceded it on the same stream.
+#[test]
+fn bpv1_14_part_before_any_header_meta_closes() {
+    let block_id = block::Hash([0x6C; 32]);
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    let s = peer.step(Instant::now(), tiny_part_prefix(block_id, 0));
+    assert_closed(&peer, Bpv1CloseRow::Row21DataBeforeHeaderMeta);
+    assert!(!s
+        .events
+        .iter()
+        .any(|e| matches!(e, PeerEvent::EarlyHeld { .. })));
+    assert_eq!(peer.early_data_bytes(), 0);
+}
+
+/// bpv1-14 (b): after this node sent its `HeaderMeta`, the peer's wanted
+/// `Part` goes to proof at once.
+#[test]
+fn bpv1_14_part_after_our_header_meta_is_accepted() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x6D; 32]);
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    assert!(queues_meta(
+        &peer.step(now, admitted(block_id, tiny(), node_id(3)))
+    ));
+    assert!(sent_want(&peer.step(now, pull(block_id, 0, &[0], now))).is_some());
+    let s = peer.step(now, tiny_part_prefix(block_id, 0));
+    assert!(peer.close_cause().is_none());
+    assert!(verify_token(&s).is_some(), "the part goes to proof");
+    assert_eq!(peer.early_data_bytes(), 0);
+    peer.assert_invariants();
+}
+
+/// bpv1-14 (c): a seed behind the proposer's `HeaderMeta` arrives while
+/// local admission still runs. It waits in the early record, and admission
+/// replays it to proof without sending the metadata back (bpv1-4).
+#[test]
+fn bpv1_14_part_behind_header_meta_under_admission_waits_then_is_accepted() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x6E; 32]);
+    // Node 2 proposed the block that `admit_tiny` admits.
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(
+        now,
+        PeerInput::RecvHeaderMeta {
+            block_id,
+            message: proposer_meta(block_id, node_id(2)),
+        },
+    );
+    peer.step(now, have_with(block_id, HaveFlags::Push, vec![0]));
+    let held = peer.step(now, tiny_part_prefix(block_id, 0));
+    assert!(peer.close_cause().is_none());
+    assert!(held
+        .events
+        .iter()
+        .any(|e| matches!(e, PeerEvent::EarlyHeld { .. })));
+    assert!(
+        verify_token(&held).is_none(),
+        "the part waits for admission"
+    );
+
+    let admit = admit_tiny(&mut peer, block_id, now);
+    assert!(
+        !queues_meta(&admit),
+        "bpv1-4: the metadata never goes back to its sender"
+    );
+    assert_eq!(part_auth(&admit), Some(PartAuth::Seed));
+    assert!(verify_token(&admit).is_some(), "admission replays the part");
+    assert_eq!(peer.early_data_bytes(), 0);
+    peer.assert_invariants();
+}
+
+/// bpv1-14 (d): traffic behind metadata this session dropped returns
+/// `Drop`, never a close: the table rejected the peer's copy, or evicted
+/// the retired block.
+#[test]
+fn bpv1_14_part_for_dropped_header_meta_drops() {
+    let now = Instant::now();
+    let coding = tiny();
+    let block_id = block::Hash([0x6F; 32]);
+
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(now, recv_meta(block_id));
+    peer.step(now, have_with(block_id, HaveFlags::Plain, vec![1]));
+    peer.step(now, PeerInput::MetaRejected { block_id });
+    let s = peer.step(now, tiny_part_prefix(block_id, 0));
+    assert!(peer.close_cause().is_none());
+    assert_eq!(drop_reason(&s, 0), Some(DropReason::MetaDropped));
+    peer.step(now, have_with(block_id, HaveFlags::Plain, vec![2]));
+    assert!(peer.close_cause().is_none());
+    assert_eq!(peer.early_data_bytes(), 0);
+    peer.assert_invariants();
+
+    let mut peer = tiny_session(block_id, now);
+    peer.step(
+        now,
+        PeerInput::Retire(Retire {
+            block_id,
+            stripes: coding.stripes,
+            n: coding.n,
+        }),
+    );
+    peer.step(now, PeerInput::EvictRetired { block_id });
+    let s = peer.step(now, tiny_part_prefix(block_id, 0));
+    assert!(peer.close_cause().is_none());
+    assert_eq!(drop_reason(&s, 0), Some(DropReason::MetaDropped));
+    peer.assert_invariants();
+
+    // The session never heard of the block before it was evicted, but the
+    // peer's metadata crossed and waited.
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(now, recv_meta(block_id));
+    peer.step(now, PeerInput::EvictRetired { block_id });
+    let s = peer.step(now, tiny_part_prefix(block_id, 0));
+    assert!(
+        peer.close_cause().is_none(),
+        "the crossed metadata keeps it open"
+    );
+    assert_eq!(drop_reason(&s, 0), Some(DropReason::MetaDropped));
+    peer.step(now, have_with(block_id, HaveFlags::Plain, vec![2]));
+    assert!(peer.close_cause().is_none());
+    peer.assert_invariants();
+}
+
+/// bpv1-21: traffic behind dropped metadata spends the block's counters, as
+/// a retired block's does, so a peer cannot reuse a drop mark without bound.
+#[test]
+fn bpv1_21_traffic_behind_dropped_meta_spends_the_counters() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x74; 32]);
+    let total = tiny().total_parts().unwrap();
+    let rejected = || {
+        let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+        peer.step(now, recv_meta(block_id));
+        peer.step(now, PeerInput::MetaRejected { block_id });
+        peer
+    };
+
+    let mut peer = rejected();
+    for index in 0..total {
+        peer.step(now, tiny_part_prefix(block_id, index));
+        assert!(peer.close_cause().is_none(), "part {index} drops");
+    }
+    peer.step(now, tiny_part_prefix(block_id, 0));
+    assert_closed(&peer, Bpv1CloseRow::Row15RetiredCounterExhausted);
+
+    // A repeated `HeaderMeta` and its rejection leave the spent counter.
+    let mut peer = rejected();
+    peer.step(now, tiny_part_prefix(block_id, 0));
+    peer.step(now, recv_meta(block_id));
+    peer.step(now, PeerInput::MetaRejected { block_id });
+    for index in 1..total {
+        peer.step(now, tiny_part_prefix(block_id, index));
+        assert!(peer.close_cause().is_none(), "part {index} drops");
+    }
+    peer.step(now, tiny_part_prefix(block_id, 0));
+    assert_closed(&peer, Bpv1CloseRow::Row15RetiredCounterExhausted);
+
+    let mut peer = rejected();
+    peer.step(
+        now,
+        have_with(block_id, HaveFlags::Plain, (0..total).collect()),
+    );
+    assert!(peer.close_cause().is_none());
+    peer.step(now, have_with(block_id, HaveFlags::Plain, vec![0]));
+    assert_closed(&peer, Bpv1CloseRow::Row15RetiredCounterExhausted);
+}
+
+/// Whether `step` reports that the peer finished `block_id`.
+fn reports_block_done(step: &PeerStep, block_id: block::Hash) -> bool {
+    step.outputs
+        .iter()
+        .any(|o| matches!(o, PeerOutput::PeerBlockDone { block_id: id } if *id == block_id))
+}
+
+/// A `BlockDone` that overtook its block's `HeaderMeta` waits however long
+/// the data stream lags, and applies when the block admits: on this
+/// session's metadata, or after a rejection, on another peer's copy.
+#[test]
+fn an_early_block_done_waits_for_admission_past_the_early_age() {
+    let t0 = Instant::now();
+    let later = t0 + DEFAULT_EARLY_AGE * 3;
+    let block_id = block::Hash([0x75; 32]);
+    let new_peer = || PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+
+    let mut peer = new_peer();
+    peer.step(t0, PeerInput::RecvBlockDone { block_id });
+    peer.step(later, PeerInput::Tick);
+    peer.step(later, recv_meta(block_id));
+    let s = peer.step(later, admitted(block_id, tiny(), node_id(2)));
+    assert!(reports_block_done(&s, block_id));
+    assert!(peer.close_cause().is_none());
+    peer.assert_invariants();
+
+    let mut peer = new_peer();
+    peer.step(t0, recv_meta(block_id));
+    peer.step(t0, PeerInput::RecvBlockDone { block_id });
+    peer.step(t0, PeerInput::MetaRejected { block_id });
+    peer.step(later, PeerInput::Tick);
+    let s = peer.step(later, admitted(block_id, tiny(), node_id(3)));
+    assert!(reports_block_done(&s, block_id));
+    assert!(peer.close_cause().is_none());
+    peer.assert_invariants();
+}
+
+/// At `EARLY_CONTROL_CAP`, the oldest held control message leaves for the
+/// newest.
+#[test]
+fn the_early_control_record_evicts_its_oldest_entry_at_the_cap() {
+    let now = Instant::now();
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    let blocks: Vec<block::Hash> = (0..=EARLY_CONTROL_CAP)
+        .map(|index| {
+            let mut bytes = [0x76; 32];
+            bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+            block::Hash(bytes)
+        })
+        .collect();
+    for &block_id in &blocks {
+        peer.step(now, PeerInput::RecvBlockDone { block_id });
+    }
+    peer.assert_invariants();
+
+    let s = peer.step(now, admitted(blocks[0], tiny(), node_id(3)));
+    assert!(!reports_block_done(&s, blocks[0]), "the oldest entry left");
+    let newest = *blocks.last().unwrap();
+    let s = peer.step(now, admitted(newest, tiny(), node_id(3)));
+    assert!(reports_block_done(&s, newest));
+    peer.assert_invariants();
 }
 
 /// A node admits a `body_bytes` W2 block that node 250 proposed, with
@@ -2224,6 +2481,7 @@ fn bpv1_60_lost_proposer_flags_admit_up_to_n_seeds() {
     let block_id = block::Hash([0x69; 32]);
     // Node 2 proposed the block that `admit_tiny` admits.
     let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(t0, recv_meta(block_id));
     peer.step(t0, have_with(block_id, HaveFlags::Relay, vec![0, 1]));
     let now = t0 + DEFAULT_EARLY_AGE;
     peer.step(now, PeerInput::Tick);

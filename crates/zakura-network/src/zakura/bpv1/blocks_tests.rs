@@ -1517,10 +1517,11 @@ fn bpv1_59_lying_and_empty_announcers_cannot_stop_honest_fetches() {
         mesh.connect(0, e, honest, honest, peer_cfg, honest_est, honest_est);
     }
     mesh.connect(1, 2, honest, honest, peer_cfg, honest_est, honest_est);
-    // The entry peers' data reaches the victims after the adversaries
-    // announce, so the victims pull before any holder push arrives.
+    // The entry peers' `HeaderMeta` leads their parts on the data stream. A
+    // slow link spaces the parts behind it, so the adversaries announce and
+    // the victims pull from them before most holder pushes arrive.
     let slow_data = LinkProfile {
-        data_delay: Duration::from_millis(150),
+        rate_bps: 2_000,
         ..honest
     };
     for victim in [3, 4] {
@@ -3613,7 +3614,31 @@ fn bpv1_57_metadata_for_the_committed_tip_is_retired_at_admission() {
             | BlockOutput::ClosePeer { .. }
     )));
     let again = receive(&mut table, t0, envelope);
-    assert!(again.outputs.is_empty(), "a later copy starts no admission");
+    assert!(
+        matches!(
+            again.outputs.as_slice(),
+            [BlockOutput::MetaRejected { block_id: id, .. }] if *id == block_id
+        ),
+        "a later copy starts no admission, and its session drops the \
+         peer's later data for the block: {:?}",
+        again.outputs
+    );
+    // A forged coding on a retired block's copy closes its sender instead of
+    // setting the session's drop counters to the forged part count.
+    let mut forged = make_envelope(block_id, encoded.coding, encoded.part_root, node_id(2));
+    forged.coding.stripes = u32::MAX;
+    let forged = receive(&mut table, t0, forged);
+    assert!(
+        matches!(
+            forged.outputs.as_slice(),
+            [BlockOutput::ClosePeer {
+                row: Bpv1CloseRow::Row4BadMetaOrCommitment,
+                ..
+            }]
+        ),
+        "{:?}",
+        forged.outputs
+    );
     table.assert_invariants();
 }
 
@@ -4914,7 +4939,14 @@ fn bpv1_83_siblings_of_the_next_block_evict_each_block_above_it_once() {
             session_gen: 1,
         },
     );
-    assert!(again.outputs.is_empty() && again.events.is_empty());
+    assert!(
+        matches!(
+            again.outputs.as_slice(),
+            [BlockOutput::MetaRejected { block_id, .. }] if *block_id == above[3]
+        ) && again.events.is_empty(),
+        "only the copy's rejection: {:?}",
+        again.outputs
+    );
     assert_eq!(table.block_phase(&above[3]), Some(BlockPhase::Retired));
     table.assert_invariants();
 }

@@ -33,8 +33,8 @@
 //! Each link is one connection between the node and a mirror: header
 //! sync's stream, block sync's stream, and BPv1's control and data streams,
 //! over in-memory channels. A relay carries the mirror's BPv1 data stream
-//! to the node, and [`Mesh::hold`] makes it hold every frame, which
-//! withholds the parts of the block in flight.
+//! to the node, and [`Mesh::hold`] makes it hold every frame but
+//! `HeaderMeta`, which withholds the parts of the block in flight.
 //!
 //! Nothing here touches production code: the harness builds every service
 //! through its public startup, and the ports are the production adapters
@@ -42,7 +42,7 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     num::NonZeroU64,
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
@@ -68,9 +68,9 @@ use zakura_header_chain::Frontier;
 use zakura_network::{
     zakura::{
         bpv1::{
-            BlockPhase, BlockVerifierPort, HavePacing, HeaderChainAdmissionAdapter,
-            MemoryBodyStore, PortFuture, Profile, VerifierVerdict, WorkId, BPV1_CONTROL_KIND,
-            BPV1_DATA_KIND,
+            wire::message_type, BlockPhase, BlockVerifierPort, HavePacing,
+            HeaderChainAdmissionAdapter, MemoryBodyStore, PortFuture, Profile, VerifierVerdict,
+            WorkId, BPV1_CONTROL_KIND, BPV1_DATA_KIND,
         },
         framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
         BlockRangeSource, BlockSyncAction, BlockSyncFrontiers, BlockSyncService, BlockSyncStartup,
@@ -580,8 +580,8 @@ impl Mesh {
         self.node.bpv1.block_phase(&hash)
     }
 
-    /// Holds, or releases, every BPv1 data frame from mirror `index` to the
-    /// node.
+    /// Holds, or releases, every BPv1 data frame but `HeaderMeta` from mirror
+    /// `index` to the node.
     pub fn hold(&self, index: usize, held: bool) {
         self.holds[index].send_replace(held);
     }
@@ -928,7 +928,8 @@ fn spawn_actions(
 /// Links `mirror` to `node` as connection `conn`, the mirror dialing: a
 /// session of header sync, one of block sync, and one of BPv1, each side's
 /// sessions sharing its connection token. A relay carries the mirror's BPv1
-/// data stream to the node, holding every frame while `held` is set.
+/// data stream to the node, holding every frame but `HeaderMeta` while
+/// `held` is set.
 /// Returns the mirror's token and the node's.
 fn link(
     sim: &mut Sim,
@@ -1017,8 +1018,11 @@ fn link(
     tokens
 }
 
-/// Carries frames from `from` to `to` in order, holding each while `held`
-/// is set, until `token` is cancelled or either end closes.
+/// Carries frames from `from` to `to` in order, until `token` is cancelled
+/// or either end closes. While `held` is set, the relay queues every frame
+/// except `HeaderMeta`, which leads its block's traffic on the data stream, so
+/// the node admits a held block but receives none of its parts. Lifting the
+/// hold sends the queued frames in order.
 fn relay(
     sim: &mut Sim,
     mut from: FramedRecv,
@@ -1027,21 +1031,34 @@ fn relay(
     token: CancellationToken,
 ) {
     sim.scheduler().spawn_root("bpv1-data-relay", async move {
+        let mut queued = VecDeque::new();
         loop {
+            if !*held.borrow_and_update() {
+                while let Some(frame) = queued.pop_front() {
+                    zakura_rt::select! {
+                        () = token.cancelled() => return,
+                        sent = to.send(frame) => if sent.is_err() {
+                            return;
+                        },
+                    }
+                }
+            }
             let frame = zakura_rt::select! {
                 () = token.cancelled() => return,
+                changed = held.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 frame = from.recv() => match frame {
                     Some(frame) => frame,
                     None => return,
                 },
             };
-            while *held.borrow_and_update() {
-                zakura_rt::select! {
-                    () = token.cancelled() => return,
-                    changed = held.changed() => if changed.is_err() {
-                        return;
-                    },
-                }
+            if *held.borrow() && frame.message_type != message_type::HEADER_META {
+                queued.push_back(frame);
+                continue;
             }
             zakura_rt::select! {
                 () = token.cancelled() => return,

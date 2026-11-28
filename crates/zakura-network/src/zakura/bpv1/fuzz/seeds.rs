@@ -484,11 +484,14 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
         (MESH_TICK_LONG, 0, 200),
     ]);
     // The receivers' header admission fails locally, then a stalled link.
+    // Each write sends the proposer's `HeaderMeta` to the next receiver.
     let mut local_failures = propose(0);
     local_failures.extend([
-        (MESH_CONTROL, 0, 0),
+        (MESH_WRITE, 0, 0),
+        (MESH_DATA, 0, 0),
         (MESH_FAIL, 1, 0),
-        (MESH_CONTROL, 0, 0),
+        (MESH_WRITE, 1, 0),
+        (MESH_DATA, 0, 0),
         (MESH_FAIL, 2, 0),
     ]);
     local_failures.extend(pump(3));
@@ -519,7 +522,8 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
     sync_past.extend(pump(4));
     sync_past.extend(propose(1));
     sync_past.extend([
-        (MESH_CONTROL, 0, 0),
+        (MESH_WRITE, 0, 0),
+        (MESH_DATA, 0, 0),
         (MESH_STALL_OR_FALLBACK, 0, 2),
         (MESH_TICK, 0, 1),
     ]);
@@ -527,7 +531,8 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
     // The adversary flags a push to node 1, then sends the part forged.
     let mut forged = propose(0);
     forged.extend([
-        (MESH_CONTROL, 0, 0),
+        (MESH_WRITE, 0, 0),
+        (MESH_DATA, 0, 0),
         (MESH_COMPLETE, 1, 0),
         (MESH_COMPLETE, 1, 0),
         (MESH_ADVERSARY, 0x25, 0x01),

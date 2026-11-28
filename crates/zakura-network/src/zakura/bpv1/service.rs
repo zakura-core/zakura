@@ -468,8 +468,8 @@ impl SharedNode {
                 session_gen,
                 row,
             } => {
-                // Blocks close only for `HeaderMeta` rows 3 and 4, read on control.
-                self.protocol_close(&peer, session_gen, BPV1_CONTROL_KIND, row);
+                // Blocks close only for `HeaderMeta` rows 3 and 4, read on data.
+                self.protocol_close(&peer, session_gen, BPV1_DATA_KIND, row);
             }
             BlockOutput::ClaimBody { block_id, deadline } => {
                 let installed = self.fallback.claim(block_id, deadline);
@@ -1430,12 +1430,13 @@ impl Session {
                 PeerRoute::Session(output) => output,
             };
         match output {
-            PeerOutput::SendControl(msg) => {
+            PeerOutput::SendControl(msg) => self.ctrl.push(msg),
+            PeerOutput::SendHeaderMeta(msg) => {
                 if let Some(block_id) = header_meta_trace_id(&msg) {
                     tracing::debug!(target: "bpv1_stage", %block_id, ?peer,
                         session_gen = self.state.session_gen(), "header_meta_send_started");
                 }
-                self.ctrl.push(msg);
+                self.data.push_header_meta(msg);
             }
             PeerOutput::SendHave {
                 block_id,
@@ -1628,6 +1629,12 @@ impl Session {
                     return false;
                 }
             }
+            Written::HeaderMeta(block_id) => {
+                if let Some(block_id) = block_id {
+                    tracing::debug!(target: "bpv1_stage", %block_id, peer = ?self.peer_node,
+                        session_gen = conn_id, "header_meta_written");
+                }
+            }
         }
         self.data.start();
         true
@@ -1651,11 +1658,16 @@ pub(super) enum Written {
         indices: Vec<u32>,
     },
     WantEnd,
+    /// The block a `HeaderMeta` names, when stage tracing is on.
+    HeaderMeta(Option<block::Hash>),
 }
 
 impl Written {
     fn of(item: DataQueueItem) -> Self {
         match item {
+            DataQueueItem::HeaderMeta(message) => {
+                Written::HeaderMeta(header_meta_trace_id(&message))
+            }
             DataQueueItem::Part {
                 block_id,
                 part,
@@ -1795,23 +1807,15 @@ fn header_meta_trace_id(msg: &Bpv1Message) -> Option<block::Hash> {
 
 /// Traces a control message the transport just queued.
 fn trace_control_written(msg: &Bpv1Message, peer: NodeId, session_gen: u64) {
-    match msg {
-        Bpv1Message::HeaderMeta { .. } => {
-            if let Some(block_id) = header_meta_trace_id(msg) {
-                tracing::debug!(target: "bpv1_stage", %block_id, ?peer, session_gen,
-                    "header_meta_written");
-            }
-        }
-        Bpv1Message::Want {
-            block_id,
-            want_id,
-            stripe,
-            requested,
-        } => {
-            tracing::debug!(target: "bpv1_stage", %block_id, ?peer, want_id, stripe,
-                ?requested, session_gen, "want_written");
-        }
-        _ => {}
+    if let Bpv1Message::Want {
+        block_id,
+        want_id,
+        stripe,
+        requested,
+    } = msg
+    {
+        tracing::debug!(target: "bpv1_stage", %block_id, ?peer, want_id, stripe,
+            ?requested, session_gen, "want_written");
     }
 }
 
@@ -1833,6 +1837,14 @@ impl DataWriter {
     /// Queues `item` behind every queued item and starts writing if idle.
     pub(super) fn push(&mut self, item: DataQueueItem) {
         self.queue.push_back(item);
+        self.start();
+    }
+
+    /// Queues a `HeaderMeta` ahead of every queued item but earlier
+    /// `HeaderMeta`s and starts writing if idle (bpv1-8). It still waits
+    /// behind the frames already handed to the transport.
+    pub(super) fn push_header_meta(&mut self, message: Box<Bpv1Message>) {
+        self.queue.push_header_meta(message);
         self.start();
     }
 
@@ -1884,13 +1896,6 @@ impl DataWriter {
 pub(super) fn control_input(frame: &Frame) -> Result<PeerInput, Bpv1CloseRow> {
     let msg = decode_frame::<Bpv1Message>(frame).map_err(|_| Bpv1CloseRow::Row2Decode)?;
     Ok(match msg {
-        Bpv1Message::HeaderMeta { ref header, .. } => {
-            let block_id = parse_header(header).ok_or(Bpv1CloseRow::Row2Decode)?.hash();
-            PeerInput::RecvHeaderMeta {
-                block_id,
-                message: Box::new(msg),
-            }
-        }
         Bpv1Message::Want {
             want_id,
             block_id,
@@ -1924,28 +1929,40 @@ pub(super) fn data_input(frame: Frame) -> Result<PeerInput, Bpv1CloseRow> {
                 payload: frame.payload,
             })
         }
-        message_type::HAVE | message_type::WANT_END => match decode_frame::<Bpv1Message>(&frame) {
-            Ok(Bpv1Message::Have {
-                block_id,
-                flags,
-                form,
-                indices,
-            }) => PeerInput::RecvHave(RecvHave {
-                block_id,
-                flags,
-                form,
-                indices,
-                frame_bytes: frame.payload.len(),
-            }),
-            Ok(Bpv1Message::WantEnd { want_id, sent, .. }) => {
-                PeerInput::RecvWantEnd(RecvWantEnd { want_id, sent })
+        message_type::HEADER_META | message_type::HAVE | message_type::WANT_END => {
+            match decode_frame::<Bpv1Message>(&frame) {
+                Ok(msg @ Bpv1Message::HeaderMeta { .. }) => {
+                    let Bpv1Message::HeaderMeta { ref header, .. } = msg else {
+                        unreachable!("matched HeaderMeta");
+                    };
+                    let block_id = parse_header(header).ok_or(Bpv1CloseRow::Row2Decode)?.hash();
+                    PeerInput::RecvHeaderMeta {
+                        block_id,
+                        message: Box::new(msg),
+                    }
+                }
+                Ok(Bpv1Message::Have {
+                    block_id,
+                    flags,
+                    form,
+                    indices,
+                }) => PeerInput::RecvHave(RecvHave {
+                    block_id,
+                    flags,
+                    form,
+                    indices,
+                    frame_bytes: frame.payload.len(),
+                }),
+                Ok(Bpv1Message::WantEnd { want_id, sent, .. }) => {
+                    PeerInput::RecvWantEnd(RecvWantEnd { want_id, sent })
+                }
+                // A `Have` flags byte other than none, push, or push and relay,
+                // each with or without the bitmap bit, is a reserved flag
+                // (decision-24, decision-33).
+                Err(WireError::ReservedFlags(_)) => return Err(Bpv1CloseRow::Row1FrameHeader),
+                _ => return Err(Bpv1CloseRow::Row2Decode),
             }
-            // A `Have` flags byte other than none, push, or push and relay,
-            // each with or without the bitmap bit, is a reserved flag
-            // (decision-24, decision-33).
-            Err(WireError::ReservedFlags(_)) => return Err(Bpv1CloseRow::Row1FrameHeader),
-            _ => return Err(Bpv1CloseRow::Row2Decode),
-        },
+        }
         _ => return Err(Bpv1CloseRow::Row1FrameHeader),
     })
 }
@@ -2025,11 +2042,6 @@ async fn run_peer_routine(
             frame = ctrl_recv.recv() => {
                 let Some(frame) = frame else { break };
                 match control_input(&frame) {
-                    Ok(input @ PeerInput::RecvHeaderMeta { block_id, .. }) => {
-                        tracing::debug!(target: "bpv1_stage", %block_id, peer = ?peer_node,
-                            session_gen, "header_meta_read");
-                        input
-                    }
                     Ok(PeerInput::RecvWant(want)) => {
                         tracing::debug!(target: "bpv1_stage", block_id = %want.block_id,
                             peer = ?peer_node, want_id = want.want_id, stripe = want.stripe,
@@ -2047,6 +2059,11 @@ async fn run_peer_routine(
             frame = data_recv.recv(), if !data_paused => {
                 let Some(frame) = frame else { break };
                 match data_input(frame) {
+                    Ok(input @ PeerInput::RecvHeaderMeta { block_id, .. }) => {
+                        tracing::debug!(target: "bpv1_stage", %block_id, peer = ?peer_node,
+                            session_gen, "header_meta_read");
+                        input
+                    }
                     Ok(PeerInput::RecvPartPrefix(part)) => {
                         tracing::debug!(target: "bpv1_stage", block_id = %part.block_id,
                             peer = ?peer_node, index = part.index, session_gen, "part_frame_read");
@@ -2348,6 +2365,7 @@ fn record_peer_event(event: &PeerEvent, peer: &NodeId) {
                 DropReason::EarlyOversize => "early_oversize",
                 DropReason::LocalCapacity => "local_capacity",
                 DropReason::NotAdmitted => "not_admitted",
+                DropReason::MetaDropped => "meta_dropped",
             };
             metrics::counter!("zakura.p2p.bpv1.part.dropped", "reason" => label).increment(1);
         }

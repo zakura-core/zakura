@@ -149,9 +149,10 @@ const RAW_STREAM_WINDOW: u32 = 4 * 65_536;
 
 /// cov-3 (`bpv1-54`, `bpv1-55`, acceptance criterion 4, level-8): over real
 /// QUIC, a peer stops reading BPv1 data while a proposer serves it a 2 MB
-/// `Want`, far beyond its stream window. The proposer's control messages
-/// still reach it, it still reads the peer's next `Want`, and once the peer
-/// reads data again each `WantEnd` arrives behind exactly the parts it ends.
+/// `Want`, far beyond its stream window. The proposer still reads the peer's
+/// next `Want` on control, and its `BlockDone` reaches the peer. Once the peer reads data again, each block's
+/// `HeaderMeta` arrives ahead of its traffic (bpv1-8), and each `WantEnd`
+/// arrives behind exactly the parts it ends.
 #[tokio::test]
 async fn bpv1_54_55_control_progresses_and_ends_follow_parts_while_data_is_paused(
 ) -> Result<(), BoxError> {
@@ -222,11 +223,27 @@ async fn bpv1_54_55_control_progresses_and_ends_follow_parts_while_data_is_pause
     );
     send_want(&mut raw, 1, big.hash(), 0..big_k).await?;
 
-    // bpv1-54: with data paused, the next block's metadata still arrives on
-    // control, and the proposer still reads the next `Want`.
+    // bpv1-54: with data paused, the proposer still reads the next `Want`.
+    // The small block's `HeaderMeta` waits on the paused data stream, so the
+    // peer asks for slot 0, which every layout has.
     assert!(handle_v.publish_solved_block(&small, height.0));
-    let small_k = header_meta_coding_k(&mut raw, small.hash()).await?;
+    let small_k = 1;
     send_want(&mut raw, 2, small.hash(), 0..small_k).await?;
+    // Control still reaches the peer: the proposer's `BlockDone` for the
+    // small block arrives while the peer reads no data (bpv1-9).
+    tokio::time::timeout(TEST_NET_TIMEOUT, async {
+        loop {
+            if let Bpv1Message::BlockDone { block_id, .. } =
+                decode_frame::<Bpv1Message>(&raw.recv(CONTROL).await?)?
+            {
+                if block_id == small.hash() {
+                    return Ok::<_, BoxError>(());
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| "bpv1-54: no control frame reached the paused peer")??;
 
     // bpv1-55: reading data again, each end follows exactly its parts. The
     // proposer flags the raw peer's seeds in `Have`s ahead of them
@@ -236,6 +253,8 @@ async fn bpv1_54_55_control_progresses_and_ends_follow_parts_while_data_is_pause
     let mut parts = [(big.hash(), 0u16), (small.hash(), 0u16)];
     let mut seeded = [0u32; 2];
     let mut ended = [None, None];
+    // The big block's `HeaderMeta` was read above.
+    let mut meta_read = [true, false];
     while ended.iter().any(Option::is_none)
         || seeded[0] < u32::try_from(seeds[0].len())?
         || seeded[1] < u32::try_from(seeds[1].len())?
@@ -249,6 +268,7 @@ async fn bpv1_54_55_control_progresses_and_ends_follow_parts_while_data_is_pause
                     .enumerate()
                     .find(|(_, (hash, _))| *hash == block_id)
                     .ok_or("a part of an unknown block")?;
+                assert!(meta_read[i], "bpv1-8 a part arrived before its HeaderMeta");
                 if seeds[i].contains(&index) {
                     seeded[i] += 1;
                     continue;
@@ -276,7 +296,19 @@ async fn bpv1_54_55_control_progresses_and_ends_follow_parts_while_data_is_pause
                     .enumerate()
                     .find(|(_, (hash, _))| *hash == block_id)
                     .ok_or("a Have of an unknown block")?;
+                assert!(meta_read[i], "bpv1-8 a Have arrived before its HeaderMeta");
                 seeds[i].extend(indices);
+            }
+            Bpv1Message::HeaderMeta { header, .. } => {
+                let header: block::Header =
+                    zakura_chain::serialization::ZcashDeserialize::zcash_deserialize(&header[..])?;
+                let (i, _) = parts
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (hash, _))| *hash == header.hash())
+                    .ok_or("a HeaderMeta of an unknown block")?;
+                assert!(!meta_read[i], "bpv1-4 a second HeaderMeta");
+                meta_read[i] = true;
             }
             other => return Err(format!("unexpected data frame {other:?}").into()),
         }
@@ -300,14 +332,14 @@ async fn bpv1_54_55_control_progresses_and_ends_follow_parts_while_data_is_pause
     Ok(())
 }
 
-/// Reads control until `block_id`'s `HeaderMeta` and returns its `k`.
+/// Reads data until `block_id`'s `HeaderMeta` and returns its `k`.
 async fn header_meta_coding_k(
     raw: &mut RawLayoutPeer,
     block_id: block::Hash,
 ) -> Result<u32, BoxError> {
     loop {
         if let Bpv1Message::HeaderMeta { header, coding, .. } =
-            decode_frame::<Bpv1Message>(&raw.recv(CONTROL).await?)?
+            decode_frame::<Bpv1Message>(&raw.recv(DATA).await?)?
         {
             let header: block::Header =
                 zakura_chain::serialization::ZcashDeserialize::zcash_deserialize(&header[..])?;
@@ -344,7 +376,7 @@ struct RawSession {
     raw: RawLayoutPeer,
     /// Keep the node serving.
     _endpoint: zakura_quic::QuicEndpoint,
-    _handle: super::service::Bpv1Handle,
+    handle: super::service::Bpv1Handle,
 }
 
 /// Starts a [`RawSession`].
@@ -386,26 +418,35 @@ async fn raw_session(shutdown: &CancellationToken, seed: u64) -> Result<RawSessi
     Ok(RawSession {
         raw,
         _endpoint: endpoint,
-        _handle: handle,
+        handle,
     })
 }
 
 /// Shows that the session still reads both streams: a `Want` for a block the
-/// node does not know comes back as an empty `WantEnd` on data.
+/// node does not know comes back as an empty `WantEnd` on data. Block
+/// traffic queued ahead of the end is skipped.
 async fn assert_session_open(raw: &mut RawLayoutPeer, want_id: u32) -> Result<(), BoxError> {
     send_want(raw, want_id, block::Hash([0x7E; 32]), 0..1).await?;
-    match decode_frame::<Bpv1Message>(&raw.recv(DATA).await?)? {
-        Bpv1Message::WantEnd {
-            want_id: id,
-            sent: 0,
-            reason: WantEndReason::UnknownBlock,
-        } if id == want_id => Ok(()),
-        other => Err(format!("expected an empty WantEnd, got {other:?}").into()),
+    loop {
+        match decode_frame::<Bpv1Message>(&raw.recv(DATA).await?)? {
+            Bpv1Message::WantEnd {
+                want_id: id,
+                sent: 0,
+                reason: WantEndReason::UnknownBlock,
+            } if id == want_id => return Ok(()),
+            Bpv1Message::HeaderMeta { .. }
+            | Bpv1Message::Part { .. }
+            | Bpv1Message::Have { .. } => {}
+            other => return Err(format!("expected an empty WantEnd, got {other:?}").into()),
+        }
     }
 }
 
-/// `bpv1-close-1` over real QUIC: a `Have` with each defined flags byte
-/// keeps the session open, and a reserved flags byte closes the connection.
+/// `bpv1-close-1` over real QUIC: a `Have` with a defined flags byte keeps
+/// the session open, and a reserved flags byte closes the connection. The
+/// `Have`s name a block whose `HeaderMeta` the node sent (bpv1-14). A relay
+/// flag from a peer that is not the proposer closes 20, so
+/// `close_1_reserved_have_flags_and_wrong_stream_types` covers its decoding.
 #[tokio::test]
 async fn close_1_reserved_have_flags_close_the_connection() -> Result<(), BoxError> {
     // `Have` payload: `block_id` (32 bytes), then the flags byte.
@@ -414,11 +455,15 @@ async fn close_1_reserved_have_flags_close_the_connection() -> Result<(), BoxErr
     let RawSession {
         mut raw,
         _endpoint,
-        _handle,
+        handle,
     } = raw_session(&shutdown, 911).await?;
+    let height = Height(20);
+    let solved = solved_block_of(&handle, height, vec![build_large_v6_tx(height, 99, 100)]);
+    assert!(handle.publish_solved_block(&solved, height.0));
+    header_meta_coding_k(&mut raw, solved.hash()).await?;
     let have = |flags: u8| -> Result<_, BoxError> {
         let mut frame = encode_frame(&Bpv1Message::Have {
-            block_id: block::Hash([0x7F; 32]),
+            block_id: solved.hash(),
             flags: HaveFlags::Plain,
             form: HaveForm::List,
             indices: vec![u32::from(flags)],
@@ -426,7 +471,7 @@ async fn close_1_reserved_have_flags_close_the_connection() -> Result<(), BoxErr
         frame.payload[FLAGS_AT] = flags;
         Ok(frame)
     };
-    for flags in [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay] {
+    for flags in [HaveFlags::Plain, HaveFlags::Push] {
         raw.send(DATA, &have(flags.bits())?).await?;
     }
     assert_session_open(&mut raw, 1).await?;
@@ -448,7 +493,7 @@ async fn close_2_zero_want_id_closes_the_connection() -> Result<(), BoxError> {
     let RawSession {
         mut raw,
         _endpoint,
-        _handle,
+        handle: _handle,
     } = raw_session(&shutdown, 913).await?;
     assert_session_open(&mut raw, 1).await?;
 

@@ -1,10 +1,10 @@
 //! BPv1 wire format, message tables, `WireMessage` codecs, and shared FIFO
 //! stream writer (decision-6, decision-7, decision-13, decision-14).
 //!
-//! BPv1 carries seven messages across two persistent ordered streams under one
-//! capability bit (`ZAKURA_CAP_BPV1 = 1 << 12`):
-//! - Control stream (`BPV1_CONTROL_KIND = 11`): `HeaderMeta`, `Want`, `StripeDone`, `BlockDone`
-//! - Data stream (`BPV1_DATA_KIND = 12`): `Part`, `Have`, `WantEnd`
+//! BPv1 carries seven messages across two persistent ordered streams at stream
+//! version 2, under one capability bit (`ZAKURA_CAP_BPV1 = 1 << 13`):
+//! - Control stream (`BPV1_CONTROL_KIND = 11`): `Want`, `StripeDone`, `BlockDone`
+//! - Data stream (`BPV1_DATA_KIND = 12`): `HeaderMeta`, `Part`, `Have`, `WantEnd`
 
 use std::{collections::VecDeque, time::Duration};
 
@@ -29,17 +29,22 @@ use crate::zakura::{
     FRAME_HEADER_BYTES,
 };
 
-/// Capability bit for BPv1 block propagation.
-pub const ZAKURA_CAP_BPV1: u64 = 1 << 12;
+/// Capability bit for BPv1 block propagation (stream version 2).
+///
+/// Bit `1 << 12` offered stream version 1, which carried `HeaderMeta` on the
+/// control stream. It is retired and MUST NOT be reused (COMPAT-9).
+pub const ZAKURA_CAP_BPV1: u64 = 1 << 13;
 
-/// Control stream kind: `HeaderMeta`, `Want`, `StripeDone`, `BlockDone`.
+/// Control stream kind: `Want`, `StripeDone`, `BlockDone`.
 pub const BPV1_CONTROL_KIND: u16 = 11;
 
-/// Data stream kind: `Part`, `Have`, `WantEnd`.
+/// Data stream kind: `HeaderMeta`, `Part`, `Have`, `WantEnd`.
 pub const BPV1_DATA_KIND: u16 = 12;
 
 /// Current stream version for both BPv1 streams.
-pub const BPV1_STREAM_VERSION: u16 = 1;
+///
+/// Version 2 moved `HeaderMeta` from the control stream to the data stream.
+pub const BPV1_STREAM_VERSION: u16 = 2;
 
 /// Protocol maximum live `Want`s per connection direction; server closes only above 2×.
 pub const MAX_WANTS_INFLIGHT: u32 = 64;
@@ -52,7 +57,7 @@ pub const WANT_BITMAP_BYTES: usize = 11;
 
 /// Frame discriminators, numbered as in the BPv1 spec.
 pub mod message_type {
-    /// `HeaderMeta` (control, Announcement).
+    /// `HeaderMeta` (data, Announcement).
     pub const HEADER_META: u16 = 1;
     /// `Want` (control, Request).
     pub const WANT: u16 = 4;
@@ -802,28 +807,52 @@ pub const WANT_END_RULE: MessageRule = MessageRule {
     },
 };
 
-/// Control-stream frame cap derived directly from `HeaderMeta`'s max payload.
-pub const CONTROL_FRAME_CAP: u32 = (HEADER_META_RULE.payload.max() + FRAME_HEADER_BYTES) as u32;
+/// The larger of two payload caps.
+const fn max_payload(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
 
-/// Data-stream frame cap derived directly from `Part`'s max payload.
-pub const DATA_FRAME_CAP: u32 = (PART_RULE.payload.max() + FRAME_HEADER_BYTES) as u32;
+/// Control-stream frame cap derived from the largest control payload.
+pub const CONTROL_FRAME_CAP: u32 = (max_payload(
+    WANT_RULE.payload.max(),
+    max_payload(
+        STRIPE_DONE_RULE.payload.max(),
+        BLOCK_DONE_RULE.payload.max(),
+    ),
+) + FRAME_HEADER_BYTES) as u32;
 
-/// Per-connection budget for the BPv1 control stream: one maximum
-/// `HeaderMeta` frame, whose coinbase may reach `MAX_BLOCK_BYTES`
-/// (decision-23), plus 512 KiB for the small control messages beside it.
+/// Data-stream frame cap derived from the larger of `HeaderMeta`'s and
+/// `Part`'s max payloads. A `HeaderMeta` coinbase may reach
+/// `MAX_BLOCK_BYTES` (decision-23).
+pub const DATA_FRAME_CAP: u32 =
+    (max_payload(HEADER_META_RULE.payload.max(), PART_RULE.payload.max()) + FRAME_HEADER_BYTES)
+        as u32;
+
+/// Per-connection budget for the BPv1 control stream's small messages.
 pub const BPV1_CONTROL_BUDGET: ReactorBudget = ReactorBudget {
-    // Widening `u32` to `u64` is lossless.
-    receive: CONTROL_FRAME_CAP as u64 + 512 * 1024,
-    output: CONTROL_FRAME_CAP as u64 + 512 * 1024,
+    receive: 512 * 1024,
+    output: 512 * 1024,
 }
 .assert_frame_cap(CONTROL_FRAME_CAP);
 
-/// Per-connection budget for the BPv1 data stream (covers `PULL_WINDOW = 64` parts).
+/// Per-connection budget for the BPv1 data stream: one maximum `HeaderMeta`
+/// frame plus `PULL_WINDOW = 64` maximum `Part` frames.
 pub const BPV1_DATA_BUDGET: ReactorBudget = ReactorBudget {
     receive: 8 * 1024 * 1024,
     output: 8 * 1024 * 1024,
 }
 .assert_frame_cap(DATA_FRAME_CAP);
+
+const _: () = assert!(
+    HEADER_META_RULE.payload.max()
+        + 64 * (PART_RULE.payload.max() + FRAME_HEADER_BYTES)
+        + FRAME_HEADER_BYTES
+        <= BPV1_DATA_BUDGET.receive as usize
+);
 
 /// BPv1's two persistent ordered streams, admitted together as one session.
 pub const BPV1_STREAMS: [Stream; 2] = [
@@ -832,12 +861,7 @@ pub const BPV1_STREAMS: [Stream; 2] = [
         version: BPV1_STREAM_VERSION,
         frame_cap: CONTROL_FRAME_CAP,
         capability: ZAKURA_CAP_BPV1,
-        messages: Some(&[
-            HEADER_META_RULE,
-            WANT_RULE,
-            STRIPE_DONE_RULE,
-            BLOCK_DONE_RULE,
-        ]),
+        messages: Some(&[WANT_RULE, STRIPE_DONE_RULE, BLOCK_DONE_RULE]),
         queue_depths: Some(StreamQueueDepths {
             inbound: 128,
             outbound: 128,
@@ -849,7 +873,9 @@ pub const BPV1_STREAMS: [Stream; 2] = [
         version: BPV1_STREAM_VERSION,
         frame_cap: DATA_FRAME_CAP,
         capability: ZAKURA_CAP_BPV1,
-        messages: Some(&[PART_RULE, HAVE_RULE, WANT_END_RULE]),
+        // `HeaderMeta` shares the stream with the block traffic it precedes
+        // (bpv1-8).
+        messages: Some(&[HEADER_META_RULE, PART_RULE, HAVE_RULE, WANT_END_RULE]),
         queue_depths: Some(StreamQueueDepths {
             inbound: 128,
             outbound: 128,
@@ -874,11 +900,14 @@ const fn carries(stream: &Stream, message_type: u16) -> bool {
 }
 
 /// Compile-time layout validation: every cap fits, all rules are well formed,
-/// and `Part` shares its stream with the `WantEnd` that ends its exchange
-/// (decision-6).
+/// `Part` shares its stream with the `WantEnd` that ends its exchange
+/// (decision-6), and `HeaderMeta` shares its stream with the parts and
+/// `Have`s it precedes (bpv1-8).
 const _: () = {
     Stream::validate_layout(&BPV1_STREAMS);
+    assert!(carries(&BPV1_STREAMS[1], message_type::HEADER_META));
     assert!(carries(&BPV1_STREAMS[1], message_type::PART));
+    assert!(carries(&BPV1_STREAMS[1], message_type::HAVE));
     assert!(carries(&BPV1_STREAMS[1], message_type::WANT_END));
     // Exact wire payload bounds sanity checks.
     assert!(WANT_RULE.payload.min() == 51 && WANT_RULE.payload.max() == 51);
@@ -1137,6 +1166,9 @@ impl WireMessage for Bpv1Message {
 /// writer encodes only the head of the queue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataQueueItem {
+    /// A `HeaderMeta`, queued ahead of every item but earlier `HeaderMeta`s
+    /// (bpv1-8). Cancellation never removes it.
+    HeaderMeta(Box<Bpv1Message>),
     /// A part belonging to `(block_id, stripe, index)` that may be cancelled
     /// before dequeue on `StripeDone`, `BlockDone`, or `Retire`.
     Part {
@@ -1177,6 +1209,7 @@ impl DataQueueItem {
     /// Encodes the item into its wire [`Frame`].
     pub fn encode(&self) -> Option<Frame> {
         match self {
+            Self::HeaderMeta(message) => encode_frame(message.as_ref()).ok(),
             Self::Part { block_id, part, .. } => Some(encode_part_frame(*block_id, part)),
             Self::Have {
                 block_id,
@@ -1275,6 +1308,17 @@ impl Bpv1FifoQueue {
         self.items.push_back(item);
     }
 
+    /// Queues a `HeaderMeta` ahead of every queued item except earlier
+    /// `HeaderMeta`s, so it precedes all of its block's traffic (bpv1-8).
+    pub fn push_header_meta(&mut self, message: Box<Bpv1Message>) {
+        let at = self
+            .items
+            .iter()
+            .take_while(|item| matches!(item, DataQueueItem::HeaderMeta(_)))
+            .count();
+        self.items.insert(at, DataQueueItem::HeaderMeta(message));
+    }
+
     /// Pops the next item in strict FIFO order.
     pub fn pop_front(&mut self) -> Option<DataQueueItem> {
         let item = self.items.pop_front()?;
@@ -1301,12 +1345,12 @@ impl Bpv1FifoQueue {
     }
 
     /// Purges queued unsent `Part`s and `Have`s for `block_id` (on `BlockDone` or
-    /// `Retire`, bpv1-38, bpv1-46). Never removes `WantEnd`s.
+    /// `Retire`, bpv1-38, bpv1-46). Never removes `HeaderMeta`s or `WantEnd`s.
     pub fn purge_block(&mut self, block_id: block::Hash, include_haves: bool) -> usize {
         self.remove(|item| match item {
             DataQueueItem::Part { block_id: b, .. } => *b == block_id,
             DataQueueItem::Have { block_id: b, .. } => include_haves && *b == block_id,
-            DataQueueItem::WantEnd { .. } => false,
+            DataQueueItem::HeaderMeta(_) | DataQueueItem::WantEnd { .. } => false,
         })
     }
 
@@ -1327,7 +1371,22 @@ impl Bpv1FifoQueue {
     fn bytes(item: &DataQueueItem) -> usize {
         match item {
             DataQueueItem::Part { part, .. } => part.wire_payload().len(),
-            DataQueueItem::Have { .. } | DataQueueItem::WantEnd { .. } => 0,
+            DataQueueItem::HeaderMeta(_)
+            | DataQueueItem::Have { .. }
+            | DataQueueItem::WantEnd { .. } => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_cap_registry_tests {
+    /// Section 8's registry row states these caps.
+    #[test]
+    fn frame_caps_match_the_registry() {
+        assert_eq!(
+            (super::CONTROL_FRAME_CAP, super::DATA_FRAME_CAP),
+            (59, 2_006_286),
+            "update the section 8 registry row with the caps"
+        );
     }
 }

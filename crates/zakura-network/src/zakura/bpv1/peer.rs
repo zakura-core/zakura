@@ -9,10 +9,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use zakura_chain::block;
 use zakura_quic::NodeId;
-use zakura_rt::{
-    collections::{HashMap, HashSet},
-    time::Instant,
-};
+use zakura_rt::{collections::HashMap, time::Instant};
 
 use super::{
     blocks::{ReleaseReason, MAX_PENDING_META_COUNT},
@@ -54,7 +51,7 @@ pub const DEFAULT_EARLY_AGE: Duration = Duration::from_secs(10);
 /// frames.
 pub const DEFAULT_EARLY_PEER_BYTES_CAP: usize = 2 * PART_RULE.payload.max();
 
-/// Control-stream early-record entry cap.
+/// Control-stream early-record entry cap. At the cap the oldest entry leaves.
 pub const EARLY_CONTROL_CAP: usize = 64;
 
 /// Session park cooldown on first stall (`30 s`, bpv1-58).
@@ -178,6 +175,10 @@ pub enum DropReason {
     LocalCapacity,
     /// Refused before proof because the block table no longer holds the block.
     NotAdmitted,
+    /// Arrived for a block whose `HeaderMeta` crossed but whose state this
+    /// session dropped: the table rejected the peer's copy, or evicted the
+    /// retired block (bpv1-14).
+    MetaDropped,
 }
 
 /// Block admitted locally in `BlockTable`; triggers `HeaderMeta` send (unless
@@ -328,7 +329,7 @@ pub enum PeerInput {
     /// Block admitted locally in `BlockTable`; triggers `HeaderMeta` send (unless
     /// the peer already sent it) and replays held early entries.
     BlockAdmitted(BlockAdmitted),
-    /// Inbound `HeaderMeta` decoded on the control stream.
+    /// Inbound `HeaderMeta` decoded on the data stream.
     RecvHeaderMeta {
         /// Consensus hash of the header carried in `HeaderMeta`.
         block_id: block::Hash,
@@ -436,8 +437,11 @@ pub enum PeerInput {
 /// Outputs emitted by [`PeerState::step`] for IO to execute.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerOutput {
-    /// Enqueue a control-stream message (`HeaderMeta`, `Want`, `StripeDone`, `BlockDone`).
+    /// Enqueue a control-stream message (`Want`, `StripeDone`, `BlockDone`).
     SendControl(Box<Bpv1Message>),
+    /// Enqueue a `HeaderMeta` on the data stream ahead of every queued item
+    /// but earlier `HeaderMeta`s, so it precedes its block's traffic (bpv1-8).
+    SendHeaderMeta(Box<Bpv1Message>),
     /// Enqueue a data-stream `Have` message behind queued data. A flagged
     /// `Have` precedes the [`PeerOutput::PushPart`]s it flags (bpv1-72).
     SendHave {
@@ -902,6 +906,9 @@ impl PeerBlockState {
     }
 }
 
+/// The peer traffic this session still accepts, and drops, for a block it
+/// keeps no state for: a retired block, or one whose metadata it dropped
+/// (bpv1-21). Spending past either counter closes with row 15.
 #[derive(Copy, Clone, Debug)]
 struct RetiredCounters {
     part_remaining: u32,
@@ -909,6 +916,37 @@ struct RetiredCounters {
     /// Whether the peer sent the block's `HeaderMeta` on this connection, so
     /// a repeat closes with row 5 while the block stays retired (bpv1-4).
     meta_received: bool,
+}
+
+impl RetiredCounters {
+    /// Counters for a block whose `HeaderMeta` the peer sent and this
+    /// session dropped before it saw any of the block's traffic.
+    fn for_dropped_meta(total_parts: u32) -> Self {
+        Self {
+            part_remaining: total_parts,
+            have_remaining: total_parts,
+            meta_received: true,
+        }
+    }
+
+    /// Spends one part. Returns `false` if none remained.
+    fn spend_part(&mut self) -> bool {
+        let Some(remaining) = self.part_remaining.checked_sub(1) else {
+            return false;
+        };
+        self.part_remaining = remaining;
+        true
+    }
+
+    /// Spends `count` announced indices. Returns `false` if fewer remained.
+    fn spend_have(&mut self, count: usize) -> bool {
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        let Some(remaining) = self.have_remaining.checked_sub(count) else {
+            return false;
+        };
+        self.have_remaining = remaining;
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -993,7 +1031,6 @@ enum EarlyControlKind {
 #[derive(Clone, Debug)]
 struct EarlyControlEntry {
     block_id: block::Hash,
-    received_at: Instant,
     kind: EarlyControlKind,
 }
 
@@ -1014,8 +1051,16 @@ pub struct PeerState {
     next_attempt: u64,
 
     blocks: HashMap<block::Hash, PeerBlockState>,
-    /// Blocks whose `HeaderMeta` this peer sent before local admission.
-    meta_received_pending: HashSet<block::Hash>,
+    /// Blocks whose `HeaderMeta` this peer sent before local admission, with
+    /// each block's part count from that `HeaderMeta`.
+    meta_received_pending: HashMap<block::Hash, u32>,
+    /// Blocks whose `HeaderMeta` crossed this connection but whose state this
+    /// session no longer keeps: the table rejected the peer's copy, or
+    /// evicted the retired block. Their parts and `Have`s drop while the
+    /// block's counters last (bpv1-14, bpv1-21). Holds at most
+    /// `MAX_PENDING_META_COUNT`, oldest first. An honest peer sends traffic
+    /// only for blocks in its propagation window, far fewer.
+    meta_dropped: VecDeque<(block::Hash, RetiredCounters)>,
     /// Retired block counters kept while inside `PROPAGATION_DEPTH` (bpv1-21).
     retired: HashMap<block::Hash, RetiredCounters>,
 
@@ -1065,7 +1110,8 @@ impl PeerState {
             next_want_id: 1,
             next_attempt: 1,
             blocks: HashMap::new(),
-            meta_received_pending: HashSet::new(),
+            meta_received_pending: HashMap::new(),
+            meta_dropped: VecDeque::new(),
             retired: HashMap::new(),
             wants_out: HashMap::new(),
             wants_in: HashMap::new(),
@@ -1212,9 +1258,6 @@ impl PeerState {
         if let Some(front) = self.early_data.front() {
             consider(front.received_at + self.config.early_age);
         }
-        if let Some(front) = self.early_control.front() {
-            consider(front.received_at + self.config.early_age);
-        }
         for b in self.blocks.values() {
             match (b.have_held_until, b.pending_have_since) {
                 (Some(until), _) => consider(until),
@@ -1303,19 +1346,35 @@ impl PeerState {
                 self.handle_local_block_done(block_id, &mut step);
             }
             PeerInput::RecvStripeDone { block_id, stripe } => {
-                self.handle_recv_stripe_done(now, block_id, stripe, &mut step);
+                self.handle_recv_stripe_done(block_id, stripe, &mut step);
             }
             PeerInput::RecvBlockDone { block_id } => {
-                self.handle_recv_block_done(now, block_id, &mut step);
+                self.handle_recv_block_done(block_id, &mut step);
             }
             PeerInput::Retire(retire) => self.handle_retire(retire, &mut step),
             PeerInput::MetaRejected { block_id } => {
-                self.meta_received_pending.remove(&block_id);
-                self.drop_early_for_block(block_id, &mut step);
+                if let Some(total_parts) = self.meta_received_pending.remove(&block_id) {
+                    self.note_meta_dropped(
+                        block_id,
+                        RetiredCounters::for_dropped_meta(total_parts),
+                    );
+                }
+                // Another peer's copy can still admit the block, so its held
+                // `StripeDone`s and `BlockDone` stay.
+                self.drop_early_data_for_block(block_id, &mut step);
             }
             PeerInput::EvictRetired { block_id } => {
-                self.retired.remove(&block_id);
-                self.meta_received_pending.remove(&block_id);
+                if let Some(counters) = self.retired.remove(&block_id) {
+                    self.note_meta_dropped(block_id, counters);
+                }
+                if let Some(total_parts) = self.meta_received_pending.remove(&block_id) {
+                    // The peer's metadata crossed, so its later data drops.
+                    self.note_meta_dropped(
+                        block_id,
+                        RetiredCounters::for_dropped_meta(total_parts),
+                    );
+                    self.drop_early_for_block(block_id, &mut step);
+                }
                 self.flags_lost.retain(|b| *b != block_id);
             }
             PeerInput::Tick => self.handle_tick(now, &mut step),
@@ -1385,7 +1444,8 @@ impl PeerState {
         if self.retired.contains_key(&block_id) {
             return;
         }
-        let received = self.meta_received_pending.remove(&block_id);
+        let received = self.meta_received_pending.remove(&block_id).is_some();
+        self.meta_dropped.retain(|(b, _)| *b != block_id);
         let flags_lost = self.take_flags_lost(block_id);
         let first = !self.blocks.contains_key(&block_id);
         let state = self
@@ -1408,7 +1468,7 @@ impl PeerState {
         // because a peer's later session never received this copy.
         if !state.meta_received && !state.meta_sent {
             state.meta_sent = true;
-            step.outputs.push(PeerOutput::SendControl(header_meta));
+            step.outputs.push(PeerOutput::SendHeaderMeta(header_meta));
         }
 
         // bpv1-9: proposer queues BlockDone right after HeaderMeta so no peer
@@ -1434,17 +1494,15 @@ impl PeerState {
     ) {
         // bpv1-4 / close-5: a second HeaderMeta for one block on one connection
         // closes 5 while this node keeps the block pending, admitted, or retired.
-        let duplicate = self.meta_received_pending.contains(&block_id)
+        let duplicate = self.meta_received_pending.contains_key(&block_id)
             || self.blocks.get(&block_id).is_some_and(|b| b.meta_received)
             || self.retired.get(&block_id).is_some_and(|r| r.meta_received);
         if duplicate {
-            self.close_protocol(
-                BPV1_CONTROL_KIND,
-                Bpv1CloseRow::Row5DuplicateHeaderMeta,
-                step,
-            );
+            self.close_protocol(BPV1_DATA_KIND, Bpv1CloseRow::Row5DuplicateHeaderMeta, step);
             return;
         }
+        // A dropped mark stays until admission, so a repeated `HeaderMeta`
+        // cannot refill the counters its rejection leaves.
         if let Some(block) = self.blocks.get_mut(&block_id) {
             block.meta_received = true;
             // Parts that waited for this `HeaderMeta` (bpv1-14) can now be accepted.
@@ -1452,7 +1510,11 @@ impl PeerState {
         } else if let Some(retired) = self.retired.get_mut(&block_id) {
             retired.meta_received = true;
         } else {
-            self.meta_received_pending.insert(block_id);
+            let total_parts = match &*message {
+                Bpv1Message::HeaderMeta { coding, .. } => coding.total_parts().unwrap_or(0),
+                _ => 0,
+            };
+            self.meta_received_pending.insert(block_id, total_parts);
         }
         step.events.push(PeerEvent::MetaReceived(block_id));
         if !self.retired.contains_key(&block_id) {
@@ -1472,14 +1534,13 @@ impl PeerState {
         let index = prefix.index;
         // 1. Retired block -> spend retired part counter without allocating/verifying (bpv1-21).
         if let Some(retired) = self.retired.get_mut(&block_id) {
-            if retired.part_remaining == 0 {
+            if !retired.spend_part() {
                 self.close_protocol(
                     BPV1_DATA_KIND,
                     Bpv1CloseRow::Row15RetiredCounterExhausted,
                     step,
                 );
             } else {
-                retired.part_remaining -= 1;
                 step.events.push(PeerEvent::PartDropped {
                     block_id,
                     index,
@@ -1489,9 +1550,9 @@ impl PeerState {
             return;
         }
 
-        // 2. Unknown block -> data-stream early record (bpv1-48).
+        // 2. Unadmitted block -> hold, drop, or close 21 (bpv1-14).
         let Some(block) = self.blocks.get(&block_id) else {
-            self.buffer_early_data(now, EarlyDataKind::Part(prefix), step);
+            self.recv_unadmitted(now, EarlyDataKind::Part(prefix), step);
             return;
         };
 
@@ -1860,21 +1921,18 @@ impl PeerState {
     fn handle_recv_have(&mut self, now: Instant, have: RecvHave, step: &mut PeerStep) {
         let block_id = have.block_id;
         if let Some(retired) = self.retired.get_mut(&block_id) {
-            let count = u32::try_from(have.indices.len()).unwrap_or(u32::MAX);
-            if count > retired.have_remaining {
+            if !retired.spend_have(have.indices.len()) {
                 self.close_protocol(
                     BPV1_DATA_KIND,
                     Bpv1CloseRow::Row15RetiredCounterExhausted,
                     step,
                 );
-            } else {
-                retired.have_remaining -= count;
             }
             return;
         }
 
         let Some(block) = self.blocks.get_mut(&block_id) else {
-            self.buffer_early_data(now, EarlyDataKind::Have(have), step);
+            self.recv_unadmitted(now, EarlyDataKind::Have(have), step);
             return;
         };
         let indices = have.indices;
@@ -2381,18 +2439,12 @@ impl PeerState {
         }
     }
 
-    fn handle_recv_stripe_done(
-        &mut self,
-        now: Instant,
-        block_id: block::Hash,
-        stripe: u32,
-        step: &mut PeerStep,
-    ) {
+    fn handle_recv_stripe_done(&mut self, block_id: block::Hash, stripe: u32, step: &mut PeerStep) {
         if self.retired.contains_key(&block_id) {
             return;
         }
         let Some(block) = self.blocks.get_mut(&block_id) else {
-            self.buffer_early_control(now, block_id, EarlyControlKind::StripeDone(stripe));
+            self.buffer_early_control(block_id, EarlyControlKind::StripeDone(stripe));
             return;
         };
         // close-10: out-of-range stripe or repeat.
@@ -2405,12 +2457,12 @@ impl PeerState {
             .push(PeerOutput::CancelQueuedStripe { block_id, stripe });
     }
 
-    fn handle_recv_block_done(&mut self, now: Instant, block_id: block::Hash, step: &mut PeerStep) {
+    fn handle_recv_block_done(&mut self, block_id: block::Hash, step: &mut PeerStep) {
         if self.retired.contains_key(&block_id) {
             return;
         }
         let Some(block) = self.blocks.get_mut(&block_id) else {
-            self.buffer_early_control(now, block_id, EarlyControlKind::BlockDone);
+            self.buffer_early_control(block_id, EarlyControlKind::BlockDone);
             return;
         };
         // close-11: repeat BlockDone.
@@ -2442,7 +2494,7 @@ impl PeerState {
             stripes,
             n,
         } = retire;
-        let meta_pending = self.meta_received_pending.remove(&block_id);
+        let meta_pending = self.meta_received_pending.remove(&block_id).is_some();
         self.inflight_verify.retain(|_, v| v.block_id != block_id);
         let total = stripes.saturating_mul(n);
 
@@ -2503,8 +2555,6 @@ impl PeerState {
             });
         }
         self.release_early(aged.iter().map(|e| e.kind.held_bytes()).sum(), step);
-        self.early_control
-            .retain(|e| now.saturating_duration_since(e.received_at) < early_age);
 
         // 2. Unpark after cooldown expires.
         if let Some(until) = self.parked_until {
@@ -2618,6 +2668,7 @@ impl PeerState {
     fn handle_session_end(&mut self) {
         self.blocks.clear();
         self.meta_received_pending.clear();
+        self.meta_dropped.clear();
         self.retired.clear();
         self.wants_out.clear();
         self.wants_in.clear();
@@ -2632,22 +2683,87 @@ impl PeerState {
         self.parked_until = None;
     }
 
-    /// Records control for a block whose `HeaderMeta` has not arrived. The
-    /// control early record never pauses control; a full record drops the
-    /// entry (bpv1-54).
-    fn buffer_early_control(
-        &mut self,
-        now: Instant,
-        block_id: block::Hash,
-        kind: EarlyControlKind,
-    ) {
-        if self.early_control.len() < EARLY_CONTROL_CAP {
-            self.early_control.push_back(EarlyControlEntry {
-                block_id,
-                received_at: now,
-                kind,
-            });
+    /// Holds a `StripeDone` or `BlockDone` for a block this session has not
+    /// admitted. It never pauses control (bpv1-54). The peer's `HeaderMeta`
+    /// for the block is ahead of its traffic on the data stream, which can
+    /// lag the control stream by any backlog, so the entry waits without an
+    /// age limit. It leaves when the
+    /// block admits, when the block retires, when newer entries push it out
+    /// at the cap, or when the session ends.
+    fn buffer_early_control(&mut self, block_id: block::Hash, kind: EarlyControlKind) {
+        if self.early_control.len() >= EARLY_CONTROL_CAP {
+            self.early_control.pop_front();
         }
+        self.early_control
+            .push_back(EarlyControlEntry { block_id, kind });
+    }
+
+    /// Handles a `Part` or `Have` for a block this session has not admitted
+    /// (bpv1-14). The peer's `HeaderMeta` precedes the block's traffic on the
+    /// data stream (bpv1-8), so the metadata crossed unless the peer broke
+    /// that order. Data behind metadata under local admission waits in the
+    /// early record (bpv1-48). Data behind metadata that this session dropped
+    /// spends the block's counters and drops (bpv1-21). Data whose metadata
+    /// never crossed closes 21.
+    fn recv_unadmitted(&mut self, now: Instant, kind: EarlyDataKind, step: &mut PeerStep) {
+        let block_id = kind.block_id();
+        if self.meta_received_pending.contains_key(&block_id) {
+            self.buffer_early_data(now, kind, step);
+        } else if let Some(counters) = self.dropped_counters_mut(&block_id) {
+            let spent = match &kind {
+                EarlyDataKind::Part(_) => counters.spend_part(),
+                EarlyDataKind::Have(have) => counters.spend_have(have.indices.len()),
+            };
+            if !spent {
+                self.close_protocol(
+                    BPV1_DATA_KIND,
+                    Bpv1CloseRow::Row15RetiredCounterExhausted,
+                    step,
+                );
+                return;
+            }
+            // A later admission still opens the push slots of a dropped
+            // flagged `Have` (bpv1-60).
+            self.note_dropped_early(&kind);
+            if let EarlyDataKind::Part(prefix) = kind {
+                step.events.push(PeerEvent::PartDropped {
+                    block_id,
+                    index: prefix.index,
+                    reason: DropReason::MetaDropped,
+                });
+            }
+        } else {
+            self.close_protocol(
+                BPV1_DATA_KIND,
+                Bpv1CloseRow::Row21DataBeforeHeaderMeta,
+                step,
+            );
+        }
+    }
+
+    /// Remembers that this session dropped the state of `block_id` after its
+    /// `HeaderMeta` crossed, with the traffic it still accepts for the block.
+    /// The oldest mark leaves when the set is full.
+    fn note_meta_dropped(&mut self, block_id: block::Hash, counters: RetiredCounters) {
+        if self.dropped_counters(&block_id).is_some() {
+            return;
+        }
+        if self.meta_dropped.len() >= MAX_PENDING_META_COUNT {
+            self.meta_dropped.pop_front();
+        }
+        self.meta_dropped.push_back((block_id, counters));
+    }
+
+    fn dropped_counters(&self, block_id: &block::Hash) -> Option<&RetiredCounters> {
+        self.meta_dropped
+            .iter()
+            .find_map(|(b, counters)| (b == block_id).then_some(counters))
+    }
+
+    fn dropped_counters_mut(&mut self, block_id: &block::Hash) -> Option<&mut RetiredCounters> {
+        self.meta_dropped
+            .iter_mut()
+            .find_map(|(b, counters)| (b == block_id).then_some(counters))
     }
 
     fn buffer_early_data(&mut self, now: Instant, kind: EarlyDataKind, step: &mut PeerStep) {
@@ -2726,9 +2842,9 @@ impl PeerState {
             }
             match entry.kind {
                 EarlyControlKind::StripeDone(stripe) => {
-                    self.handle_recv_stripe_done(now, block_id, stripe, step);
+                    self.handle_recv_stripe_done(block_id, stripe, step);
                 }
-                EarlyControlKind::BlockDone => self.handle_recv_block_done(now, block_id, step),
+                EarlyControlKind::BlockDone => self.handle_recv_block_done(block_id, step),
             }
         }
         for entry in data {
@@ -2745,7 +2861,16 @@ impl PeerState {
     }
 
     fn drop_early_for_block(&mut self, block_id: block::Hash, step: &mut PeerStep) {
-        let (_, data) = self.take_early_for_block(block_id, step);
+        self.early_control.retain(|e| e.block_id != block_id);
+        self.drop_early_data_for_block(block_id, step);
+    }
+
+    fn drop_early_data_for_block(&mut self, block_id: block::Hash, step: &mut PeerStep) {
+        let (data, kept): (VecDeque<_>, _) = std::mem::take(&mut self.early_data)
+            .into_iter()
+            .partition(|e| e.kind.block_id() == block_id);
+        self.early_data = kept;
+        self.release_early(data.iter().map(|e| e.kind.held_bytes()).sum(), step);
         for entry in &data {
             self.note_dropped_early(&entry.kind);
         }

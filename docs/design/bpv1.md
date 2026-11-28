@@ -116,7 +116,7 @@ block.
 On each neighbour's data stream, the proposer writes a `Have` with the push
 flag and then the parts it lists. The relay flag marks the pushed seeds. The
 flag travels on the same ordered stream as its parts, so it always arrives
-first, even when `HeaderMeta` is still in flight on the control stream.
+first. The proposer's `HeaderMeta` leads both on that stream.
 
 A holder pushes each pushed seed once it holds a verified copy from any source,
 including a part it regenerated from a checked stripe. It pushes to every peer
@@ -168,10 +168,13 @@ replies on the data stream, so it closes the `Want` only after its parts
 arrive. Timers never revoke authorization, so delay alone cannot make an honest
 sender violate it.
 
-A part or `Have` can arrive before the node admits its block. Nodes hold such
-messages in bounded early records and pause a peer's data stream when its
-record fills. They keep the control stream open for the resolving metadata. A
-16-block propagation window bounds retention of retired blocks.
+`HeaderMeta` travels on the data stream ahead of its block's parts and
+`Have`s, so a peer's metadata always arrives before its traffic for the
+block. A part or `Have` can still arrive while the node admits the block.
+Nodes hold such messages in bounded early records and pause a peer's data
+stream when its record fills. A part or `Have` whose metadata never crossed
+the connection closes it. A 16-block propagation window bounds retention of
+retired blocks.
 
 The [peer message regulation](peer-message-regulation.md) rule is: disconnect
 only when no conformant peer could have sent the message. Crossings and local

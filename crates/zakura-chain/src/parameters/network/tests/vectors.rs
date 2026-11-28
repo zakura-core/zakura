@@ -415,10 +415,12 @@ fn bip70_network_names_are_stable_for_every_network_kind() {
 fn activates_network_upgrades_correctly() {
     let expected_nu6_3_activation_height = 1;
     let expected_nu7_activation_height = 2;
+    let expected_nu7_1_activation_height = 3;
     let network = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
             nu6_3: Some(expected_nu6_3_activation_height),
             nu7: Some(expected_nu7_activation_height),
+            nu7_1: Some(expected_nu7_1_activation_height),
             ..Default::default()
         })
         .expect("failed to set activation heights")
@@ -439,6 +441,7 @@ fn activates_network_upgrades_correctly() {
     for nu in NetworkUpgrade::iter().skip(1) {
         let expected_activation_height = match nu {
             NetworkUpgrade::Nu7 => expected_nu7_activation_height,
+            NetworkUpgrade::Nu7_1 => expected_nu7_1_activation_height,
             _ => expected_nu6_3_activation_height,
         };
 

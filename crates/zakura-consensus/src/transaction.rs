@@ -1130,7 +1130,8 @@ where
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7 => Ok(()),
+            | NetworkUpgrade::Nu7
+            | NetworkUpgrade::Nu7_1 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -1233,7 +1234,8 @@ where
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7 => Ok(()),
+            | NetworkUpgrade::Nu7
+            | NetworkUpgrade::Nu7_1 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),

@@ -117,6 +117,8 @@ impl Version {
             // Regtest and custom testnets use the Testnet version.
             (Testnet(_), Nu7) => 170_180,
             (Mainnet, Nu7) => 170_190,
+            (Testnet(_), Nu7_1) => 170_200,
+            (Mainnet, Nu7_1) => 170_210,
 
             #[cfg(zcash_unstable = "zfuture")]
             (Testnet(_), ZFuture) => constants::CURRENT_NETWORK_PROTOCOL_VERSION.0,
@@ -307,6 +309,17 @@ mod test {
         );
         assert_eq!(
             Version::min_specified_for_upgrade(&Mainnet, Nu7),
+            Version(base + 10)
+        );
+
+        // NU7.1 follows the same rule from NU7's Mainnet version.
+        let base = base + 20;
+        assert_eq!(
+            Version::min_specified_for_upgrade(&testnet, Nu7_1),
+            Version(base)
+        );
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Mainnet, Nu7_1),
             Version(base + 10)
         );
     }

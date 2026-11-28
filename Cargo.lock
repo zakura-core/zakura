@@ -3316,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "base64",
  "bytes",

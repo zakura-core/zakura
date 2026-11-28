@@ -156,7 +156,7 @@ zakura-chain = { path = "../zakura-chain", version = "17.0.0" }
 zakura-consensus = { path = "../zakura-consensus", version = "18.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "6.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
-zakura-network = { path = "../zakura-network", version = "19.0.0" }
+zakura-network = { path = "../zakura-network", version = "20.0.0" }
 zakura-mempool = { path = "../zakura-mempool", version = "0.1.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "6.0.0" }
 zakura-rpc = { path = "../zakura-rpc", version = "19.0.0", default-features = false }
@@ -238,7 +238,7 @@ proptest-derive = { workspace = true }
 zakura-chain = { path = "../zakura-chain", version = "17.0.0", features = ["proptest-impl"] }
 zakura-consensus = { path = "../zakura-consensus", version = "18.0.0", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "6.0.0", features = ["test-support"] }
-zakura-network = { path = "../zakura-network", version = "19.0.0", features = ["proptest-impl", "zakura-testkit"] }
+zakura-network = { path = "../zakura-network", version = "20.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "19.0.0", features = ["proptest-impl"] }
 zakura-mempool = { path = "../zakura-mempool", version = "0.1.0", features = ["proptest-impl"] }
 zakura-rpc = { path = "../zakura-rpc", version = "19.0.0", default-features = false, features = ["proptest-impl"] }

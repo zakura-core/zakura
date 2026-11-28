@@ -33,7 +33,7 @@ use crate::common::cached_state::DATABASE_FORMAT_CHECK_INTERVAL;
 pub fn default_test_config(net: &Network) -> ZakuradConfig {
     const TEST_DURATION: Duration = Duration::from_secs(30);
 
-    let network = zakura_network::Config {
+    let mut network = zakura_network::Config {
         network: net.clone(),
         // The OS automatically chooses an unused port.
         listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -43,6 +43,12 @@ pub fn default_test_config(net: &Network) -> ZakuradConfig {
         crawl_new_peer_interval: TEST_DURATION,
         ..zakura_network::Config::default()
     };
+    if net.is_regtest() {
+        // Regtest keeps only localhost addresses from its seeds, so the public testnet seeders
+        // can never supply a peer. Startup waits for the seed lookups, and retries them until
+        // one resolves, so leaving them in makes Regtest tests depend on public DNS.
+        network.initial_testnet_peers.clear();
+    }
 
     let sync = sync::Config {
         // Avoid downloading unnecessary blocks.

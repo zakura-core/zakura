@@ -973,6 +973,7 @@ fn modern_rollback_network() -> Network {
             nu6_2: Some(10),
             nu6_3: Some(11),
             nu7: Some(12),
+            nu7_1: None,
         })
         .expect("configured activation heights are valid")
         // These chains are generated for their commitments, not their coinbases, so blocks

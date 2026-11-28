@@ -122,6 +122,7 @@ impl VctFastSyncedChain {
                 nu6_2: Some(47),
                 nu6_3: Some(48),
                 nu7: Some(50),
+                nu7_1: None,
             })
             .expect("the fixture activation heights are ordered")
             .extend_funding_streams()

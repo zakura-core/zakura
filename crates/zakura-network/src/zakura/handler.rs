@@ -256,10 +256,8 @@ const LEGACY_RESPONSE_REQUEST_ID_BYTES: usize = 8;
 const LEGACY_RESPONSE_CHUNK_HEADER_BYTES: usize = LEGACY_RESPONSE_REQUEST_ID_BYTES + 1;
 const LEGACY_COMPACT_SIZE_PREFIX_BYTES: usize = 9;
 const LEGACY_BLOCK_HASH_BYTES: usize = 32;
-const LEGACY_INVENTORY_HASH_BYTES: usize = 36;
 /// A witnessed transaction's inventory entry: a type code and two 32-byte hashes.
 const LEGACY_WTX_INVENTORY_BYTES: usize = 68;
-const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
 const _: () = assert!(LEGACY_GOSSIP_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_GOSSIP);
 const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
@@ -8083,8 +8081,10 @@ async fn write_outbound_request_frame_inner(
     flags: u16,
     payload: Vec<u8>,
 ) -> Result<ResponseFrames, OutboundRequestError> {
+    let inbound_frame_cap = inbound_frame_cap_for_stream(&limits, stream);
     // The legacy request stream validates responses with a legacy-message-specific budget.
-    let budget = LegacyResponseBudget::from_request(message_type, &payload, limits)?;
+    let budget =
+        LegacyResponseBudget::from_request(message_type, &payload, limits, inbound_frame_cap)?;
     // Fund the whole response before the stream opens. The read state's precheck
     // keeps each frame within this budget before the reader allocates its payload.
     let grant = resources
@@ -8097,7 +8097,6 @@ async fn write_outbound_request_frame_inner(
         .map_err(OutboundRequestError::Local)?
         .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
     let outbound_frame_cap = application_frame_cap(&limits, stream);
-    let inbound_frame_cap = inbound_frame_cap_for_stream(&limits, stream);
     let prelude = StreamPrelude {
         magic: STREAM_PRELUDE_MAGIC,
         stream_kind: stream.kind,
@@ -8204,10 +8203,15 @@ struct LegacyResponseBudget {
 }
 
 impl LegacyResponseBudget {
+    /// The budget for the response to a `message_type` request carrying
+    /// `payload`, under `limits`. `max_frame_bytes` is the frame cap the
+    /// responder chunks inventory under, which is the cap the requester
+    /// advertised in its prelude.
     fn from_request(
         message_type: u16,
         payload: &[u8],
         limits: ZakuraConnectionLimits,
+        max_frame_bytes: u32,
     ) -> Result<Self, OutboundRequestError> {
         let kind = match message_type {
             LEGACY_REQUEST_BLOCKS_BY_HASH => LegacyResponseKind::Blocks,
@@ -8230,19 +8234,30 @@ impl LegacyResponseBudget {
         let (max_items, max_frames, max_bytes) = match kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
                 let item_count = legacy_inventory_count(payload, kind)?;
+                // The responder splits each item into chunks that fit its frame cap,
+                // and one more frame can end the response.
+                let chunks_per_item = super::legacy_gossip::response_chunk_bytes(
+                    max_frame_bytes,
+                    limits.max_message_bytes,
+                )
+                .map_or(1, |chunk_bytes| max_message_bytes.div_ceil(chunk_bytes));
                 let max_frames = item_count
-                    .saturating_mul(LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM)
-                    .saturating_add(1);
+                    .saturating_mul(chunks_per_item)
+                    .saturating_add(1)
+                    .min(super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES);
                 let item_bytes = match kind {
                     LegacyResponseKind::Blocks => LEGACY_BLOCK_HASH_BYTES,
-                    LegacyResponseKind::Transactions => LEGACY_INVENTORY_HASH_BYTES,
+                    LegacyResponseKind::Transactions => LEGACY_WTX_INVENTORY_BYTES,
                     _ => unreachable!("matched inventory response kind"),
                 };
                 let missing_bytes = LEGACY_RESPONSE_REQUEST_ID_BYTES
                     .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
                     .saturating_add(item_count.saturating_mul(item_bytes));
+                // Chunks retain their own headers in addition to each assembled item.
+                let chunk_headers = max_frames.saturating_mul(LEGACY_RESPONSE_CHUNK_HEADER_BYTES);
                 let max_bytes = item_count
                     .saturating_mul(max_message_bytes)
+                    .saturating_add(chunk_headers)
                     .saturating_add(missing_bytes)
                     .max(LEGACY_RESPONSE_CHUNK_HEADER_BYTES);
                 (item_count, max_frames, max_bytes)
@@ -8263,9 +8278,7 @@ impl LegacyResponseBudget {
             LegacyResponseKind::TransactionIds => {
                 let max_bytes = LEGACY_RESPONSE_REQUEST_ID_BYTES
                     .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
-                    .saturating_add(
-                        max_inventory_items.saturating_mul(LEGACY_INVENTORY_HASH_BYTES),
-                    );
+                    .saturating_add(max_inventory_items.saturating_mul(LEGACY_WTX_INVENTORY_BYTES));
                 (max_inventory_items, 1, max_bytes)
             }
             LegacyResponseKind::Pong | LegacyResponseKind::Nil => {
@@ -8344,16 +8357,15 @@ impl LegacyResponseBudget {
             .saturating_add(LEGACY_RESPONSE_REQUEST_ID_BYTES)
             .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
             .min(COMPAT_RESPONSE_MAX_AGGREGATE_BYTES);
-        let most_frames = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES
-            / LEGACY_RESPONSE_CHUNK_HEADER_BYTES.saturating_add(1);
         let filled_frames =
             (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / chunk_bytes).saturating_add(self.max_items);
+        // The encoder stops at `LEGACY_RESPONSE_MAX_FRAMES`, however small the chunks.
         let frames = self
             .max_items
             .saturating_mul(chunks_per_item)
             .min(filled_frames)
-            .min(most_frames)
-            .saturating_add(1);
+            .saturating_add(1)
+            .min(super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES);
         ResponseBound {
             // Widening usize to u64 is lossless on supported targets.
             bytes: payload_bytes
@@ -8434,8 +8446,12 @@ fn response_bound(
     if stream_kind != LEGACY_REQUEST_STREAM_KIND {
         return Some(underived);
     }
-    let Ok(budget) = LegacyResponseBudget::from_request(frame.message_type, &frame.payload, limits)
-    else {
+    let Ok(budget) = LegacyResponseBudget::from_request(
+        frame.message_type,
+        &frame.payload,
+        limits,
+        max_frame_bytes,
+    ) else {
         return Some(underived);
     };
     Some(budget.response_bound(max_frame_bytes)).filter(|bound| bound.bytes <= gate_bytes)
@@ -13547,8 +13563,13 @@ mod tests {
         // Legacy streams have no rows, but their request budget still rejects
         // a header before the peer supplies any payload bytes.
         let mut legacy = LegacyResponseReadState::new(
-            LegacyResponseBudget::from_request(LEGACY_REQUEST_PING, &[], test_connection_limits())
-                .unwrap(),
+            LegacyResponseBudget::from_request(
+                LEGACY_REQUEST_PING,
+                &[],
+                test_connection_limits(),
+                test_connection_limits().max_frame_bytes,
+            )
+            .unwrap(),
         );
         for (payload_len, expected) in [
             (9, FrameRejection::AboveReservation { bytes: 8 }),
@@ -14567,9 +14588,13 @@ mod tests {
 
         for (request, kind, response, requested) in cases {
             let request = request.encode_frame()?;
-            let budget =
-                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
-                    .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            let budget = LegacyResponseBudget::from_request(
+                request.message_type,
+                &request.payload,
+                limits,
+                limits.max_frame_bytes,
+            )
+            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
             let item_bytes = match kind {
                 LegacyRequestKind::Blocks => BLOCK_TESTNET_141042_BYTES.len(),
                 LegacyRequestKind::Transactions => transaction.size(),
@@ -14767,9 +14792,13 @@ mod tests {
         ];
         for (request, response) in cases {
             let request = request.encode_frame()?;
-            let budget =
-                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
-                    .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            let budget = LegacyResponseBudget::from_request(
+                request.message_type,
+                &request.payload,
+                limits,
+                limits.max_frame_bytes,
+            )
+            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
             let mut frames = LegacyResponseCodec::encode_response(
                 request_id,
                 response,
@@ -14808,6 +14837,7 @@ mod tests {
             request_frame.message_type,
             &request_frame.payload,
             limits,
+            limits.max_frame_bytes,
         )
         .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
         let frames = LegacyResponseCodec::encode_response(
@@ -15025,9 +15055,13 @@ mod tests {
         let blocks = LegacyRequestFrame::BlocksByHash(vec![block_hash(7); max_items])
             .encode_frame()
             .expect("max-inventory blocks request encodes");
-        let blocks_budget =
-            LegacyResponseBudget::from_request(blocks.message_type, &blocks.payload, limits)
-                .expect("budget derives from a max-inventory blocks request");
+        let blocks_budget = LegacyResponseBudget::from_request(
+            blocks.message_type,
+            &blocks.payload,
+            limits,
+            limits.max_frame_bytes,
+        )
+        .expect("budget derives from a max-inventory blocks request");
         assert!(
             blocks_budget.max_bytes <= COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
             "BlocksByHash retained-frame budget {} must be clamped to the aggregate cap {}",
@@ -15039,8 +15073,13 @@ mod tests {
         let txs = LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(7); max_items])
             .encode_frame()
             .expect("max-inventory transactions request encodes");
-        let txs_budget = LegacyResponseBudget::from_request(txs.message_type, &txs.payload, limits)
-            .expect("budget derives from a max-inventory transactions request");
+        let txs_budget = LegacyResponseBudget::from_request(
+            txs.message_type,
+            &txs.payload,
+            limits,
+            limits.max_frame_bytes,
+        )
+        .expect("budget derives from a max-inventory transactions request");
         assert!(
             txs_budget.max_bytes <= COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
             "TransactionsById retained-frame budget {} must be clamped to the aggregate cap {}",
@@ -15054,9 +15093,13 @@ mod tests {
         let small = LegacyRequestFrame::BlocksByHash(vec![block_hash(1)])
             .encode_frame()
             .expect("single-item blocks request encodes");
-        let small_budget =
-            LegacyResponseBudget::from_request(small.message_type, &small.payload, limits)
-                .expect("budget derives from a single-item blocks request");
+        let small_budget = LegacyResponseBudget::from_request(
+            small.message_type,
+            &small.payload,
+            limits,
+            limits.max_frame_bytes,
+        )
+        .expect("budget derives from a single-item blocks request");
         assert!(
             small_budget.max_bytes >= limits.max_message_bytes as usize,
             "a single-item request must still permit one full response message; budget was {}",
@@ -15110,8 +15153,13 @@ mod tests {
             .pop()
             .expect("a 501-hash list fits in one frame under the test limits");
             let mut state = LegacyResponseReadState::new(
-                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
-                    .expect("a FindBlocks request has a known response kind"),
+                LegacyResponseBudget::from_request(
+                    request.message_type,
+                    &request.payload,
+                    limits,
+                    limits.max_frame_bytes,
+                )
+                .expect("a FindBlocks request has a known response kind"),
             );
 
             let result = state.validate_frame(request_id, frame.clone());
@@ -15137,8 +15185,13 @@ mod tests {
         .pop()
         .expect("a three-hash list fits in one frame under the test limits");
         let mut state = LegacyResponseReadState::new(
-            LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
-                .expect("a FindBlocks request has a known response kind"),
+            LegacyResponseBudget::from_request(
+                request.message_type,
+                &request.payload,
+                limits,
+                limits.max_frame_bytes,
+            )
+            .expect("a FindBlocks request has a known response kind"),
         );
         let result = state.validate_frame(request_id, frame.clone());
         assert!(
@@ -15168,6 +15221,7 @@ mod tests {
                     request_frame.message_type,
                     &request_frame.payload,
                     limits,
+                    limits.max_frame_bytes,
                 )
                 .expect("budget derives from request")
             };
@@ -16379,6 +16433,103 @@ mod tests {
         .await?;
 
         server_ep.shutdown().await;
+        Ok(())
+    }
+    /// A peer with a small negotiated frame cap can return a full-size block.
+    #[test]
+    fn small_frame_caps_accept_full_block_responses() -> Result<(), BoxError> {
+        use zakura_chain::serialization::ZcashSerialize;
+        let mut block = Block::zcash_deserialize(BLOCK_TESTNET_141042_BYTES.as_slice())?;
+        let size = block.zcash_serialize_to_vec()?.len();
+        let output = &mut Arc::make_mut(&mut block.transactions[0]).outputs_mut()[0];
+        let script_size = output.lock_script.as_raw_bytes().len() + 2_000_000 - size - 4;
+        output.lock_script = zakura_chain::transparent::Script::new(&vec![0; script_size]);
+        let block = Arc::new(block);
+        let request = LegacyRequestFrame::BlocksByHash(vec![block.hash()]).encode_frame()?;
+        let mut limits = test_connection_limits();
+        limits.max_frame_bytes = 64 * 1024;
+        limits.max_message_bytes = u32::try_from(block.zcash_serialize_to_vec()?.len())?;
+        assert_eq!(limits.max_message_bytes, 2_000_000);
+        let budget = LegacyResponseBudget::from_request(
+            request.message_type,
+            &request.payload,
+            limits,
+            limits.max_frame_bytes,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let mut state = LegacyResponseReadState::new(budget);
+        let frames = LegacyResponseCodec::encode_response(
+            1,
+            Response::Blocks(vec![InventoryResponse::Available((block.into(), None))]),
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )?;
+        assert!(frames.len() > 9);
+        for frame in frames {
+            state
+                .validate_frame(1, frame)
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        state.finish().map_err(|error| format!("{error:?}"))?;
+        Ok(())
+    }
+
+    /// An inventory response may take as many frames as the responder's chunks
+    /// for its items need, plus one, so an empty request allows a single frame.
+    #[test]
+    fn inventory_frame_allowance_follows_the_responder_chunking() -> Result<(), BoxError> {
+        let limits = test_connection_limits();
+        let allowance = |count: usize, frame_cap: u32| -> Result<usize, BoxError> {
+            let hashes = (0..count)
+                .map(|_| zakura_chain::block::Hash([7; 32]))
+                .collect();
+            let request = LegacyRequestFrame::BlocksByHash(hashes).encode_frame()?;
+            let budget = LegacyResponseBudget::from_request(
+                request.message_type,
+                &request.payload,
+                limits,
+                frame_cap,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            Ok(budget.max_frames)
+        };
+        assert_eq!(allowance(0, limits.max_frame_bytes)?, 1);
+        // A 2,000,000-byte block across 64 KiB frames needs 31 chunks.
+        assert!(allowance(1, 64 * 1024)? > 31);
+        assert_eq!(
+            allowance(
+                usize::try_from(MAX_TX_INV_IN_SENT_MESSAGE)?,
+                limits.max_frame_bytes
+            )?,
+            super::super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES
+        );
+        Ok(())
+    }
+
+    /// The responder reserves output for no more frames than its encoder can
+    /// build, so a tiny negotiated frame cap doesn't inflate the reservation.
+    #[test]
+    fn tiny_frame_caps_reserve_at_most_the_encoder_frame_ceiling() -> Result<(), BoxError> {
+        let limits = test_connection_limits();
+        let request = LegacyRequestFrame::BlocksByHash(vec![zakura_chain::block::Hash([7; 32])])
+            .encode_frame()?;
+        let budget = LegacyResponseBudget::from_request(
+            request.message_type,
+            &request.payload,
+            limits,
+            limits.max_frame_bytes,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        // A 20-byte frame cap leaves three object bytes per chunk.
+        let reserved = budget.response_bound(20).bytes;
+        let most = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES.saturating_add(
+            super::super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES
+                .saturating_mul(RESPONSE_FRAME_OVERHEAD_BYTES),
+        );
+        assert!(
+            reserved <= u64::try_from(most)?,
+            "reserved {reserved} bytes"
+        );
         Ok(())
     }
 }

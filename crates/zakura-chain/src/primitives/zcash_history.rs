@@ -442,7 +442,8 @@ impl Version for zakura_mmr_tree::V1 {
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7 => {}
+            | NetworkUpgrade::Nu7
+            | NetworkUpgrade::Nu7_1 => {}
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => {}
         };

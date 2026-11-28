@@ -1501,7 +1501,8 @@ impl PeerState {
             self.close_protocol(BPV1_DATA_KIND, Bpv1CloseRow::Row5DuplicateHeaderMeta, step);
             return;
         }
-        self.meta_dropped.retain(|(b, _)| *b != block_id);
+        // A dropped mark stays until admission, so a repeated `HeaderMeta`
+        // cannot refill the counters its rejection leaves.
         if let Some(block) = self.blocks.get_mut(&block_id) {
             block.meta_received = true;
             // Parts that waited for this `HeaderMeta` (bpv1-14) can now be accepted.
@@ -2682,13 +2683,11 @@ impl PeerState {
         self.parked_until = None;
     }
 
-    /// Records control for a block whose `HeaderMeta` has not arrived. The
-    /// control early record never pauses control; a full record drops the
-    /// entry (bpv1-54).
     /// Holds a `StripeDone` or `BlockDone` for a block this session has not
-    /// admitted. The peer's `HeaderMeta` for the block is ahead of its
-    /// traffic on the data stream, which can lag the control stream by any
-    /// backlog, so the entry waits without an age limit. It leaves when the
+    /// admitted. It never pauses control (bpv1-54). The peer's `HeaderMeta`
+    /// for the block is ahead of its traffic on the data stream, which can
+    /// lag the control stream by any backlog, so the entry waits without an
+    /// age limit. It leaves when the
     /// block admits, when the block retires, when newer entries push it out
     /// at the cap, or when the session ends.
     fn buffer_early_control(&mut self, block_id: block::Hash, kind: EarlyControlKind) {

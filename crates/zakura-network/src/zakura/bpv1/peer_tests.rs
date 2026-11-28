@@ -1909,6 +1909,18 @@ fn bpv1_21_traffic_behind_dropped_meta_spends_the_counters() {
     peer.step(now, tiny_part_prefix(block_id, 0));
     assert_closed(&peer, Bpv1CloseRow::Row15RetiredCounterExhausted);
 
+    // A repeated `HeaderMeta` and its rejection leave the spent counter.
+    let mut peer = rejected();
+    peer.step(now, tiny_part_prefix(block_id, 0));
+    peer.step(now, recv_meta(block_id));
+    peer.step(now, PeerInput::MetaRejected { block_id });
+    for index in 1..total {
+        peer.step(now, tiny_part_prefix(block_id, index));
+        assert!(peer.close_cause().is_none(), "part {index} drops");
+    }
+    peer.step(now, tiny_part_prefix(block_id, 0));
+    assert_closed(&peer, Bpv1CloseRow::Row15RetiredCounterExhausted);
+
     let mut peer = rejected();
     peer.step(
         now,

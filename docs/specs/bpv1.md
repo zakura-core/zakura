@@ -124,7 +124,10 @@ reconstruction deadline. The node MUST install the claim before it submits the
 header to header admission. Native block sync requests the bodies of the
 headers that header admission publishes, so a later claim can lose that race.
 Metadata that leaves admission without a block slot releases the claim, and
-native block sync then fetches the body at once.
+native block sync then fetches the body at once. When every copy of a block's
+metadata fails its commitment check, no later copy claims the body while the
+block stays in BPv1's window, so repeated bad metadata cannot keep native block
+sync off the block. BPv1 can still deliver the block without a claim.
 
 When native block sync learns a header before BPv1 claims its body, and the
 height lies in BPv1's window (section 2) while BPv1 has a live session, native
@@ -134,6 +137,8 @@ reservation into the claim. Native block sync reserves each block at most once,
 and never reserves a block that it saw claimed, so BPv1 delays a body by at
 most one grace before its claim, and never after a release. A release for any
 reason but commitment marks the block, so a later request is never reserved.
+A mark keeps the highest height that the node saw for the block, because a
+peer's header-sync status names the height of its target.
 The node remembers at most 1,024 such blocks, and reserves nothing new at that
 cap. A block that the cap leaves unmarked still stops reservations at or below
 its height until the window moves above that height. A request that native block sync started before any claim or reservation

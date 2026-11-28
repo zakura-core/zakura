@@ -44,6 +44,10 @@ pub enum BodyClaimRelease {
     Fallback,
     /// Block retired or consensus-invalid.
     Retired,
+    /// Every copy of the block's metadata failed its commitment check.
+    /// Native block sync fetches the body, and BPv1 never claims it again,
+    /// so repeated bad metadata cannot keep deferring native block sync.
+    FailedMeta,
 }
 
 /// The heights whose bodies BPv1 may fetch, as BPv1 last published them.
@@ -95,6 +99,10 @@ struct Table {
     /// the cap. Nothing at or below it is reserved until BPv1's window moves
     /// above it, so a skipped mark never lets a hash be reserved again.
     unmarked_through: Option<u32>,
+    /// Hashes released for [`BodyClaimRelease::FailedMeta`], by height. They
+    /// are never claimed again, and leave with [`Self::seen`]. Holds at most
+    /// [`MAX_SEEN`].
+    failed_meta: HashMap<block::Hash, u32>,
     window: Option<Bpv1Window>,
     /// The node ids of the peers with a live BPv1 session. Only they send
     /// this node `HeaderMeta`.
@@ -108,10 +116,12 @@ impl Table {
         before - self.entries.len()
     }
 
-    /// Records `hash` at `height` in [`Self::seen`]. At the cap, raises
-    /// [`Self::unmarked_through`] to `height` instead.
+    /// Records `hash` at `height` in [`Self::seen`], keeping the highest
+    /// height seen for it: a header-sync target's height comes from the peer.
+    /// At the cap, raises [`Self::unmarked_through`] to `height` instead.
     fn see(&mut self, hash: block::Hash, height: u32) {
-        if self.seen.contains_key(&hash) {
+        if let Some(marked) = self.seen.get_mut(&hash) {
+            *marked = (*marked).max(height);
             return;
         }
         if self.seen.len() < MAX_SEEN {
@@ -166,7 +176,8 @@ impl SharedBodyClaims {
     ///
     /// Returns `true` if the claim is newly installed, replaces an expired
     /// entry, or replaces a live reservation. Returns `false` if a live claim
-    /// already exists or `deadline` has passed.
+    /// already exists, `deadline` has passed, or `hash` was released for
+    /// [`BodyClaimRelease::FailedMeta`].
     pub fn claim_at(&self, hash: block::Hash, deadline: Instant, now: Instant) -> bool {
         let earlier_expiry = {
             let mut table = self.lock();
@@ -178,7 +189,7 @@ impl SharedBodyClaims {
                 .entries
                 .get(&hash)
                 .is_some_and(|entry| entry.kind == EntryKind::Claimed);
-            if now >= deadline || claimed {
+            if now >= deadline || claimed || table.failed_meta.contains_key(&hash) {
                 drop(table);
                 if pruned {
                     self.bump_generation();
@@ -233,6 +244,10 @@ impl SharedBodyClaims {
                 // keeps the mark until the window passes it.
                 if let Some(window) = table.window {
                     table.see(hash, window.high_inclusive);
+                    if reason == BodyClaimRelease::FailedMeta && table.failed_meta.len() < MAX_SEEN
+                    {
+                        table.failed_meta.insert(hash, window.high_inclusive);
+                    }
                 }
             }
             table.entries.remove(&hash).is_some()
@@ -252,6 +267,9 @@ impl SharedBodyClaims {
         if let Some(window) = window {
             table
                 .seen
+                .retain(|_, height| *height > window.low_exclusive);
+            table
+                .failed_meta
                 .retain(|_, height| *height > window.low_exclusive);
             if table
                 .unmarked_through
@@ -299,8 +317,11 @@ impl SharedBodyClaims {
             table.see(hash, height);
             return true;
         }
-        if table.seen.contains_key(&hash)
-            || table.seen.len() >= MAX_SEEN
+        if let Some(marked) = table.seen.get_mut(&hash) {
+            *marked = (*marked).max(height);
+            return false;
+        }
+        if table.seen.len() >= MAX_SEEN
             || table
                 .unmarked_through
                 .is_some_and(|through| height <= through)
@@ -678,6 +699,51 @@ mod tests {
             "at the cap, both syncs fetch at once"
         );
         assert_eq!(claims.lock().seen.len(), MAX_SEEN);
+    }
+
+    #[test]
+    fn a_failed_meta_release_refuses_every_later_claim() {
+        let claims = SharedBodyClaims::new();
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_secs(15);
+        let failed = block::Hash([0xAA; 32]);
+        claims.set_bpv1_window(window(84, 116));
+        claims.set_bpv1_peer([7; 32], true);
+        assert!(claims.claim_at(failed, deadline, t0));
+        assert!(claims.release(failed, BodyClaimRelease::FailedMeta));
+
+        assert!(
+            !claims.claim_at(failed, deadline, t0),
+            "another copy's metadata cannot defer native block sync again"
+        );
+        assert!(!claims.is_claimed(failed, t0));
+        assert!(!claims.defer_to_bpv1(failed, 101, t0));
+
+        claims.set_bpv1_window(window(116, 140));
+        assert!(
+            claims.claim_at(failed, deadline, t0),
+            "the mark leaves with the window"
+        );
+    }
+
+    #[test]
+    fn a_mark_keeps_the_highest_height_it_was_seen_at() {
+        let claims = SharedBodyClaims::new();
+        let t0 = Instant::now();
+        let hash = block::Hash([0xAA; 32]);
+        claims.set_bpv1_window(window(84, 116));
+        claims.set_bpv1_peer([7; 32], true);
+        // Header sync reserves at a peer's height, and native block sync
+        // later asks at the header's own height.
+        assert!(claims.defer_to_bpv1(hash, 86, t0));
+        let expired = t0 + Duration::from_secs(1);
+        assert!(!claims.defer_to_bpv1(hash, 101, expired));
+
+        claims.set_bpv1_window(window(90, 122));
+        assert!(
+            !claims.defer_to_bpv1(hash, 101, expired),
+            "the mark stays while the window holds the header's height"
+        );
     }
 
     #[test]

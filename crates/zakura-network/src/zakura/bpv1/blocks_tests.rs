@@ -5330,7 +5330,8 @@ fn every_admission_exit_releases_the_early_claim() {
         table.assert_invariants();
     }
 
-    // A failed commitment with no other copy releases the claim too.
+    // A failed commitment with no other copy releases the claim, and no later
+    // copy claims the body again.
     let id = block::Hash([0xC5; 32]);
     let received = start(&mut table, &claims, id);
     let checking = header_result(&mut table, t0, &received, admitted_at(10));
@@ -5344,7 +5345,10 @@ fn every_admission_exit_releases_the_early_claim() {
         },
     );
     apply_claims(&claims, t0, &failed);
-    assert_eq!(release_of(&failed, id), Some(ClaimRelease::Fallback));
+    assert_eq!(
+        release_of(&failed, id),
+        Some(ClaimRelease::FailedCommitment)
+    );
     assert!(!claims.is_claimed(id, t0));
 
     // Block sync committed the block while its commitment check ran.

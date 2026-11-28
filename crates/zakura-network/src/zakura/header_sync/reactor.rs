@@ -1450,6 +1450,8 @@ impl HeaderSyncReactor {
             OfferDecision::AwaitSubscription => self.close_subscription(&peer),
             OfferDecision::Stage => {
                 if self.holds_for_bpv1(&peer, &target.status) {
+                    // The held status supersedes the peer's unstarted target.
+                    self.peer_work_queue.remove_unstarted(&peer);
                     return;
                 }
                 self.stage_offer(peer, target, priority)

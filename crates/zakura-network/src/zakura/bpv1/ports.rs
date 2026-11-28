@@ -241,6 +241,7 @@ impl BlockFallbackPort for SharedBodyClaims {
             // (decision-22), as a fallback does.
             ClaimRelease::Fallback | ClaimRelease::Repair => BodyClaimRelease::Fallback,
             ClaimRelease::Retired => BodyClaimRelease::Retired,
+            ClaimRelease::FailedCommitment => BodyClaimRelease::FailedMeta,
         };
         SharedBodyClaims::release(self, hash, mapped)
     }

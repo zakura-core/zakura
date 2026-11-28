@@ -253,6 +253,9 @@ pub enum ClaimRelease {
     Repair,
     /// Retired / consensus-invalid / evicted.
     Retired,
+    /// Every copy of the metadata failed its commitment check. Block sync
+    /// fetches the body, and no later copy claims it again.
+    FailedCommitment,
 }
 
 /// Decoded `HeaderMeta` envelope presented to [`BlockTable`].
@@ -2714,9 +2717,10 @@ impl BlockTable {
             &mut later,
             step,
         ) else {
-            // No copy is left to check, so block sync fetches the body. An
-            // alternate keeps the claim while its own check runs.
-            release_admission_claim(step, block_id, ClaimRelease::Fallback);
+            // No copy is left to check, so block sync fetches the body. A
+            // later copy can carry another bad binding, so it claims nothing.
+            // An alternate keeps the claim while its own check runs.
+            release_admission_claim(step, block_id, ClaimRelease::FailedCommitment);
             return;
         };
         let (from_peer, session_gen) = promote_alternate(senders, &mut later);

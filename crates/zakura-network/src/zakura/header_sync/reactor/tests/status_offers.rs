@@ -3148,6 +3148,43 @@ fn header_sync_holds_only_a_bpv1_peer_inside_the_window() {
     assert!(!claims.is_claimed(below, Instant::now()));
 }
 
+/// A held status supersedes the peer's unstarted target, as every other
+/// offer outcome does, so header sync never answers the stale target.
+#[test]
+fn a_held_status_drops_the_peers_unstarted_target() {
+    use zakura_node_services::body_claims::{Bpv1Window, SharedBodyClaims};
+
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let claims = SharedBodyClaims::new();
+    let window = |low_exclusive| {
+        Some(Bpv1Window {
+            low_exclusive,
+            high_inclusive: 16,
+            grace: std::time::Duration::from_secs(1),
+        })
+    };
+    reactor.startup.body_claims = Some(claims.clone());
+    let (peer, _outbound) = connect(&mut reactor, 0x34);
+    claims.set_bpv1_peer([0x34; 32], true);
+
+    // `status_for` advertises height 2: below the first window, inside the
+    // second.
+    claims.set_bpv1_window(window(5));
+    let first = block::Hash([0x44; 32]);
+    reactor.handle_status(peer.clone(), 0, status_for(&snapshot, first));
+    expect_locator_query(&mut actions, &peer, first);
+    assert!(reactor.peer_work_queue.awaiting_target(&peer).is_some());
+
+    claims.set_bpv1_window(window(0));
+    let held = block::Hash([0x45; 32]);
+    reactor.handle_status(peer.clone(), 0, status_for(&snapshot, held));
+    assert!(claims.is_claimed(held, Instant::now()));
+    assert!(
+        reactor.peer_work_queue.awaiting_target(&peer).is_none(),
+        "the held status superseded the unstarted target"
+    );
+}
+
 /// The running reactor ends a BPv1 hold on its own: when BPv1 releases the
 /// claim, and when the reservation expires.
 #[tokio::test(start_paused = true)]

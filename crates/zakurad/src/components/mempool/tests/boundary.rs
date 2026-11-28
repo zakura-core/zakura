@@ -872,6 +872,29 @@ async fn admitted_body_is_served_by_every_query(mode: Mode) {
     harness.verifier.expect_no_requests().await;
 }
 
+async fn legacy_announcer_is_sent_to_network_download_request(mode: Mode) {
+    let mut harness = active_pool(mode).await;
+    let id = samples(1).remove(0).transaction.id();
+    let addr = std::net::SocketAddr::from(([192, 0, 2, 1], 48233));
+
+    harness
+        .ask(Request::QueueFromPeer {
+            transactions: vec![id.into()],
+            source: QueueSource::LegacySocket(addr),
+        })
+        .await;
+    harness
+        .peers
+        .expect_request(zn::Request::TransactionsByIdFrom {
+            ids: [id].into(),
+            source: zn::PeerSource::LegacySocket(addr.into()),
+        })
+        .await
+        .respond(zn::Response::Transactions(vec![
+            zn::InventoryResponse::Missing(id),
+        ]));
+}
+
 async fn queued_id_is_fetched_then_verified(mode: Mode) {
     let mut harness = active_pool(mode).await;
     let sample = samples(1).remove(0);
@@ -1999,6 +2022,7 @@ both_pools!(
     empty_active_pool_answers_each_query_as_today,
     admitted_body_is_served_by_every_query,
     queued_id_is_fetched_then_verified,
+    legacy_announcer_is_sent_to_network_download_request,
     failed_fetch_answers_the_receiver_and_caches_nothing,
     failed_verification_is_answered_then_cached_for_the_tip,
     local_verifier_failures_are_not_cached,

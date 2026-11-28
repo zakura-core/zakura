@@ -139,6 +139,24 @@ impl FundingStreams {
         self
     }
 
+    /// Moves an end height above NU7.1 so the stream ends at the same time with ZIP 223's
+    /// 20 second spacing. Apply it after [`Self::with_nu7_adjusted_end_height`].
+    ///
+    /// See [`nu7_1_adjusted_funding_stream_height`].
+    ///
+    /// # Panics
+    ///
+    /// If the moved end height is above [`Height::MAX`], which built-in heights can't reach.
+    pub(crate) fn with_nu7_1_adjusted_end_height(
+        mut self,
+        nu7_1_activation: Option<Height>,
+    ) -> Self {
+        self.height_range.end =
+            nu7_1_adjusted_funding_stream_height(self.height_range.end, nu7_1_activation)
+                .expect("built-in funding stream end heights stay below Height::MAX after NU7.1");
+        self
+    }
+
     /// Returns recipients of these [`FundingStreams`].
     pub fn recipients(&self) -> &HashMap<FundingStreamReceiver, FundingStreamRecipient> {
         &self.recipients
@@ -262,6 +280,13 @@ pub trait ParameterSubsidy {
         None
     }
 
+    /// Returns the NU7.1 activation height, where ZIP 223's 20 second target spacing starts.
+    ///
+    /// Returns `None` when the network has no NU7.1 activation height.
+    fn nu7_1_activation_height(&self) -> Option<Height> {
+        None
+    }
+
     /// Returns the expected public seed or configured override, or zero when unset.
     /// State derives the actual seed from monetary pools unless a configured override applies.
     fn initial_nsm_value_balance(&self) -> Amount<NonNegative>;
@@ -314,6 +339,10 @@ impl ParameterSubsidy for Network {
         NetworkUpgrade::Nu7.activation_height(self)
     }
 
+    fn nu7_1_activation_height(&self) -> Option<Height> {
+        NetworkUpgrade::Nu7_1.activation_height(self)
+    }
+
     fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
         match self {
             Network::Mainnet => mainnet::INITIAL_NSM_VALUE_BALANCE,
@@ -341,6 +370,15 @@ impl ParameterSubsidy for Network {
 /// [`nu7_adjusted_funding_stream_height`] moves keeps its old address period, so a stream
 /// needs the same number of recipient addresses after ZIP 218 as before it.
 ///
+/// From NU7.1 activation `A20`, the period advances with elapsed target time at ZIP 223's
+/// 20 second spacing, keeping its progress at `A20`. In seconds of target time:
+///
+/// > AddressPeriod(height) := floor((75 · (A + PostBlossomHalvingInterval − FirstHalvingHeight)
+/// > + 25 · (A20 − A) + 20 · (height − A20)) / (75 · FSRecipientChangeInterval))
+///
+/// A boundary that [`nu7_1_adjusted_funding_stream_height`] moves keeps its old address
+/// period too.
+///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
 pub fn funding_stream_address_period<N: ParameterSubsidy>(
     height: Height,
@@ -362,8 +400,20 @@ pub fn funding_stream_address_period<N: ParameterSubsidy>(
     // positive. The regression test uses a height one block before the
     // address-period anchor: its numerator is -1, so `/` would truncate it
     // to 0 rather than floor it to -1.
-    match network.nu7_activation_height() {
-        Some(nu7_activation) if height >= nu7_activation => {
+    match (
+        network.nu7_activation_height(),
+        network.nu7_1_activation_height(),
+    ) {
+        (Some(nu7_activation), Some(nu7_1_activation)) if height >= nu7_1_activation => {
+            let blossom = HeightDiff::from(POST_BLOSSOM_POW_TARGET_SPACING);
+            let nu7 = HeightDiff::from(POST_NU7_POW_TARGET_SPACING);
+            let nu7_1 = HeightDiff::from(POST_NU7_1_POW_TARGET_SPACING);
+            (blossom * period_offset(nu7_activation)
+                + nu7 * (nu7_1_activation - nu7_activation)
+                + nu7_1 * (height - nu7_1_activation))
+                .div_euclid(blossom * change_interval)
+        }
+        (Some(nu7_activation), _) if height >= nu7_activation => {
             let ratio = HeightDiff::from(NU7_POW_TARGET_SPACING_RATIO);
             (ratio * period_offset(nu7_activation) + (height - nu7_activation))
                 .div_euclid(ratio * change_interval)
@@ -400,6 +450,35 @@ pub fn nu7_adjusted_funding_stream_height(
     (height.0 - nu7_activation.0)
         .checked_mul(NU7_POW_TARGET_SPACING_RATIO)
         .and_then(|blocks| nu7_activation.0.checked_add(blocks))
+        .map(Height)
+        .filter(|height| *height <= Height::MAX)
+}
+
+/// Returns the height that a funding stream end height moves to under ZIP 223.
+///
+/// ZIP 223 shortens the target spacing at NU7.1 activation `A20` from 25 to 20 seconds, so
+/// an end height above `A20`, already moved by [`nu7_adjusted_funding_stream_height`], moves
+/// to `A20 + 5/4 · (height − A20)` to keep its date. ZIP 223 doesn't say how to round that
+/// yet. This rounds up, so a stream that ends at the third halving still ends at
+/// `HeightForHalving(3)`. End heights at or below `A20`, and all end heights on a network
+/// without NU7.1, stay where they are.
+///
+/// Returns `None` if the moved height is above [`Height::MAX`].
+pub fn nu7_1_adjusted_funding_stream_height(
+    height: Height,
+    nu7_1_activation: Option<Height>,
+) -> Option<Height> {
+    let Some(nu7_1_activation) =
+        nu7_1_activation.filter(|nu7_1_activation| *nu7_1_activation < height)
+    else {
+        return Some(height);
+    };
+
+    let blocks = u64::from(height.0 - nu7_1_activation.0) * u64::from(POST_NU7_POW_TARGET_SPACING);
+    let moved =
+        u64::from(nu7_1_activation.0) + blocks.div_ceil(u64::from(POST_NU7_1_POW_TARGET_SPACING));
+    u32::try_from(moved)
+        .ok()
         .map(Height)
         .filter(|height| *height <= Height::MAX)
 }

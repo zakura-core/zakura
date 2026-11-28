@@ -790,7 +790,7 @@ impl Arbitrary for Transaction {
                 Self::v5_strategy(ledger_state)
             ]
             .boxed(),
-            NetworkUpgrade::Nu7 => Self::v5_strategy(ledger_state),
+            NetworkUpgrade::Nu7 | NetworkUpgrade::Nu7_1 => Self::v5_strategy(ledger_state),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Self::v5_strategy(ledger_state),

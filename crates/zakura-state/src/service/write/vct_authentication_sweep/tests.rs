@@ -113,6 +113,7 @@ fn parameters(checkpoint_blocks: Option<&[Arc<Block>]>) -> Network {
             nu6_2: Some(NU6_2),
             nu6_3: Some(NU6_3),
             nu7: Some(NU7),
+            nu7_1: None,
         })
         .expect("the compressed activation schedule is ordered")
         .with_disable_pow(true)
@@ -197,7 +198,8 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7 => Transaction::V5 {
+            | NetworkUpgrade::Nu7
+            | NetworkUpgrade::Nu7_1 => Transaction::V5 {
                 network_upgrade: upgrade,
                 lock_time: LockTime::unlocked(),
                 expiry_height: height,

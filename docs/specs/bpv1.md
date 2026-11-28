@@ -1133,6 +1133,13 @@ section 2, the node MUST stop issuing pulls for the block and SHOULD send
 `BlockDone` to every peer that knows the block. Its outstanding `Want`s stay
 live until their `WantEnd`s arrive.
 
+When the node sees its verified tip move to a block that native block sync
+committed while the node still collects it, or while its metadata is still in
+admission, the node SHOULD retire the block. It then stops issuing pulls, frees
+the block's slot, and submits no second copy to the validator. A block whose
+commit a newer tip already superseded when the node learns of it keeps its
+reconstruction deadline.
+
 After a stripe passes its re-encode check, the node MAY send the stripe's parts
 it never received to accepted subscribers of their lanes. These parts obey
 the ordinary skip, send-once, and wanted rules. The node SHOULD NOT send them to

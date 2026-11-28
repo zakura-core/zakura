@@ -1219,8 +1219,8 @@ reads as unset, so those nodes also get the small handshake windows.
     the last checkpoint, whichever is larger. The `Sessions` floor funds 19
     full connections on Mainnet. With the draft values and
     `p2p_stack = "zakura"`, Mainnet, Testnet and Regtest each need a host of
-    about 9.3 GiB. In `Dual` mode, legacy TCP ingress and one legacy read add
-    1.2 GiB of fixed terms, and Mainnet needs about 10.8 GiB. Below its
+    about 9.9 GiB. In `Dual` mode, legacy TCP ingress and one legacy read add
+    1.2 GiB of fixed terms, and Mainnet needs about 11.4 GiB. Below its
     minimum, the node starts with no shared space and logs one warning that
     lists every term and each raised setting that adds to them. It refuses
     only once the draft constants are measured.
@@ -1238,8 +1238,8 @@ reads as unset, so those nodes also get the small handshake windows.
     BPv1 session funds its base `b_bpv1` from `Sessions` when BPv1 admits the
     peer: its unsolicited receive credit, its output gates, its held frames
     and its early records. BPv1 adds 22.9 MiB to a full connection, so a
-    16 GiB Mainnet host funds 48 full connections, not 89, and the smallest
-    Mainnet host grows from about 9.3 GiB to about 10.0 GiB.
+    16 GiB Mainnet host funds 47 full connections, not 78, and the smallest
+    Mainnet host grows from about 9.9 GiB to about 10.7 GiB.
   - **Preferred gateways.** A mining node holds up to ten connection places
     above `max_connections` for the mining gateways it ranks highest. While
     places are held, ordinary connections leave one full connection's bases

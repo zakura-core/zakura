@@ -180,7 +180,8 @@ pub enum DropReason {
     NotAdmitted,
     /// Arrived for a block whose `HeaderMeta` crossed but whose state this
     /// session dropped: the table rejected the peer's copy, or evicted the
-    /// retired block (bpv1-14).
+    /// retired block. After the session forgot a dropped block, also any
+    /// block whose `HeaderMeta` this session never saw (bpv1-14).
     MetaDropped,
 }
 
@@ -1026,9 +1027,13 @@ pub struct PeerState {
     /// Blocks whose `HeaderMeta` crossed this connection but whose state this
     /// session no longer keeps: the table rejected the peer's copy, or
     /// evicted the retired block. Their parts and `Have`s drop (bpv1-14).
-    /// Holds at most `MAX_PENDING_META_COUNT`, oldest first. An honest peer
-    /// sends traffic only for blocks in its propagation window, far fewer.
+    /// Holds at most `MAX_PENDING_META_COUNT`, oldest first.
     meta_dropped: VecDeque<block::Hash>,
+    /// Whether [`Self::meta_dropped`] forgot a block to stay bounded. The
+    /// peer's traffic for that block may still arrive, so this session can no
+    /// longer tell dropped metadata from missing metadata, and drops traffic
+    /// for every unknown block instead of closing 21.
+    meta_dropped_forgot: bool,
     /// Retired block counters kept while inside `PROPAGATION_DEPTH` (bpv1-21).
     retired: HashMap<block::Hash, RetiredCounters>,
 
@@ -1080,6 +1085,7 @@ impl PeerState {
             blocks: HashMap::new(),
             meta_received_pending: HashSet::new(),
             meta_dropped: VecDeque::new(),
+            meta_dropped_forgot: false,
             retired: HashMap::new(),
             wants_out: HashMap::new(),
             wants_in: HashMap::new(),
@@ -2639,6 +2645,7 @@ impl PeerState {
         self.blocks.clear();
         self.meta_received_pending.clear();
         self.meta_dropped.clear();
+        self.meta_dropped_forgot = false;
         self.retired.clear();
         self.wants_out.clear();
         self.wants_in.clear();
@@ -2676,12 +2683,14 @@ impl PeerState {
     /// data stream (bpv1-8), so the metadata crossed unless the peer broke
     /// that order. Data behind metadata under local admission waits in the
     /// early record (bpv1-48). Data behind metadata that this session dropped
-    /// drops. Data whose metadata never crossed closes 21.
+    /// drops. Data whose metadata never crossed closes 21, unless this
+    /// session forgot a dropped block: then the data may be that block's, and
+    /// drops.
     fn recv_unadmitted(&mut self, now: Instant, kind: EarlyDataKind, step: &mut PeerStep) {
         let block_id = kind.block_id();
         if self.meta_received_pending.contains(&block_id) {
             self.buffer_early_data(now, kind, step);
-        } else if self.meta_dropped.contains(&block_id) {
+        } else if self.meta_dropped_forgot || self.meta_dropped.contains(&block_id) {
             // A later admission still opens the push slots of a dropped
             // flagged `Have` (bpv1-60).
             self.note_dropped_early(&kind);
@@ -2702,13 +2711,15 @@ impl PeerState {
     }
 
     /// Remembers that this session dropped the state of `block_id` after its
-    /// `HeaderMeta` crossed. The oldest mark leaves when the set is full.
+    /// `HeaderMeta` crossed. The oldest mark leaves when the set is full, and
+    /// close 21 turns off for the rest of the session.
     fn note_meta_dropped(&mut self, block_id: block::Hash) {
         if self.meta_dropped.contains(&block_id) {
             return;
         }
         if self.meta_dropped.len() >= MAX_PENDING_META_COUNT {
             self.meta_dropped.pop_front();
+            self.meta_dropped_forgot = true;
         }
         self.meta_dropped.push_back(block_id);
     }

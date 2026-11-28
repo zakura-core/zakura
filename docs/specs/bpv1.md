@@ -594,7 +594,10 @@ peer is lying. The receiver cannot yet check such a message.
   - The metadata crossed, but this node dropped it: admission rejected the
     peer's copy, or the retired block left the retired record. The message
     returns `Drop`. The receiver remembers these blocks in a per-peer set
-    bounded like pending metadata.
+    bounded like pending metadata. When the set is full, the oldest block
+    leaves it. The peer's traffic for that block can still arrive, so from
+    then on the receiver handles every message of the next case as this one,
+    and returns `Drop`, until the session ends.
   - The metadata crossed the connection in neither direction. The message
     returns `Disconnect` (close-21): a conformant peer queues the metadata
     ahead of the block's traffic on the same stream.
@@ -987,8 +990,8 @@ authorize its seeds (section 3).
 - **Reservation precheck**, on the fixed prefix `(block_id, index)`
   - a block this node has not admitted follows section 3: behind the peer's
     `HeaderMeta` under admission it goes to the data-stream early record,
-    behind dropped metadata it returns `Drop`, and otherwise it returns
-    `Disconnect` (close-21)
+    behind dropped metadata, or after the session forgot a dropped block, it
+    returns `Drop`, and otherwise it returns `Disconnect` (close-21)
   - a retired block spends the peer's retired part counter and returns `Drop`;
     an exhausted counter returns `Disconnect`
   - `index < stripes * n`

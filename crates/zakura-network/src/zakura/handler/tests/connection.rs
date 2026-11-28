@@ -85,6 +85,7 @@ pub(in crate::zakura::handler) async fn connect_holding_credits_and_serve(
                     conn,
                     control_handshake: None,
                     registration_report: None,
+                    connection_token: None,
                 },
             )
             .await

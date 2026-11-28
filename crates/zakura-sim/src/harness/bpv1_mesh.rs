@@ -69,8 +69,8 @@ use zakura_network::{
     zakura::{
         bpv1::{
             BlockPhase, BlockVerifierPort, HavePacing, HeaderChainAdmissionAdapter,
-            MemoryBodyStore, PortFuture, Profile, VerifierVerdict, WorkId,
-            BPV1_CONTROL_KIND, BPV1_DATA_KIND,
+            MemoryBodyStore, PortFuture, Profile, VerifierVerdict, WorkId, BPV1_CONTROL_KIND,
+            BPV1_DATA_KIND,
         },
         framed_channel,
         memory::{MemoryPlan, MemoryPool},
